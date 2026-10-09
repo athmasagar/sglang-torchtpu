@@ -38,6 +38,17 @@ class TestWanTembTableSlices(unittest.TestCase):
         for ref, out in zip(reference, fused):
             self.assertTrue(torch.equal(ref, out))
 
+    def test_eager_slices_are_contiguous_and_match_chunks(self):
+        torch.manual_seed(3)
+        temb = torch.randn(2, 9, 6, 64, dtype=torch.bfloat16)
+        table = torch.randn(1, 6, 64, dtype=torch.float32)
+        chunks = (table.unsqueeze(0) + temb.float()).chunk(6, dim=2)
+        slices = _eager_temb_table_slices(table, temb)
+        self.assertEqual(len(slices), 6)
+        for chunk, out in zip(chunks, slices):
+            self.assertTrue(torch.equal(chunk.squeeze(2), out))
+            self.assertTrue(out.is_contiguous())
+
     def test_cpu_falls_back_to_eager(self):
         torch.manual_seed(2)
         temb = torch.randn(1, 9, 6, 64, dtype=torch.bfloat16)
