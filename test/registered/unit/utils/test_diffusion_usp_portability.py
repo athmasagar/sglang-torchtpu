@@ -134,6 +134,29 @@ class TestUspPortableLayouts(unittest.TestCase):
         for actual in usp._usp_input_all_to_all_packed_qkv(x[0], x[0], x[0]):
             torch.testing.assert_close(actual, x[0], rtol=0, atol=0)
 
+    def test_exchange_keeps_the_tensor_shape(self):
+        # Equal dim-0 splits equal the flat exchange; a flattened buffer costs
+        # torch_tpu relayout copies around the collective.
+        usp = _load_usp()
+        usp.get_sp_group = lambda: SimpleNamespace(ulysses_group=object())
+        seen = []
+
+        def all_to_all_single(output, input, group=None):
+            seen.append(tuple(input.shape))
+            output.copy_(input)
+
+        x = torch.arange(4 * 3 * 2 * 5, dtype=torch.float32).reshape(4, 3, 2, 5)
+        with patch.object(
+            usp.torch.distributed, "all_to_all_single", all_to_all_single
+        ):
+            # A non-contiguous view of x: exchanged as a contiguous copy.
+            out = usp._usp_all_to_all_single(
+                x.transpose(2, 3).contiguous().transpose(2, 3)
+            )
+        self.assertEqual(seen, [(4, 3, 2, 5)])
+        self.assertEqual(out.shape, x.shape)
+        torch.testing.assert_close(out, x, rtol=0, atol=0)
+
     def test_eligible_eager_merge_still_dispatches_to_cuda(self):
         # Routing only; CUDA numerical coverage lives in the layout kernel tests.
         facade = sys.modules[usp_merge_heads.__module__]

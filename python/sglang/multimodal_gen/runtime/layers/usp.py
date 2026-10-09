@@ -97,8 +97,10 @@ def _a2a_staging_buffer(
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
-    x_shape = x.shape
-    x = x.flatten().contiguous()
+    # Every caller's dim 0 splits evenly over the group, so exchanging the
+    # tensor in its own shape moves the same bytes as a flat exchange; a
+    # flattened buffer costs torch_tpu relayout copies around the collective.
+    x = x.contiguous()
     if role is None:
         output = torch.empty_like(x)
     else:
@@ -106,7 +108,7 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
     torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
-    return output.reshape(x_shape)
+    return output
 
 
 def _usp_all_to_all_single_varlen(
