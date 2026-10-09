@@ -279,7 +279,6 @@ class Platform:
         return self.is_rocm()
 
     @classmethod
-    @lru_cache(maxsize=1)
     def is_amp_supported(cls) -> bool:
         return True
 

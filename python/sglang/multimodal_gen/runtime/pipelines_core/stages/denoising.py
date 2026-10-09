@@ -1569,7 +1569,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ) -> DenoisingStepState:
         """Build the per-step state shared by the loop and model-specific hooks."""
         t_int = int(t_host.item())
-        t_device = ctx.timesteps[step_index]
+        # A view of the schedule carries a step-dependent storage offset, which
+        # torch_tpu's compiled-executable key includes: each step would recompile.
+        t_device = ctx.timesteps[step_index].clone()
         current_model, current_guidance_scale = self._select_and_manage_model(
             t_int=t_int,
             boundary_timestep=ctx.boundary_timestep,
