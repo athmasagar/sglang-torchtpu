@@ -325,18 +325,32 @@ def halo_exchange(
     recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row_ref)
     p2p_ops = []
 
-    if rank > 0:
-        prev_rank = group_ranks[rank - 1]
-        top_row = top_row_ref.contiguous(memory_format=_halo_memory_format(top_row_ref))
-        p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
-        p2p_ops.append(dist.P2POp(dist.isend, top_row, prev_rank, group))
-    if rank < world_size - 1:
-        next_rank = group_ranks[rank + 1]
-        bottom_row = bottom_row_ref.contiguous(
-            memory_format=_halo_memory_format(bottom_row_ref)
-        )
-        p2p_ops.append(dist.P2POp(dist.isend, bottom_row, next_rank, group))
-        p2p_ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, next_rank, group))
+    if not current_platform.supports_distributed_p2p():
+        if world_size > 1:
+            _gather_neighbor_halos(
+                top_row_ref,
+                bottom_row_ref,
+                recv_top_buf,
+                recv_bottom_buf,
+                decode_group,
+                rank,
+                world_size,
+            )
+    else:
+        if rank > 0:
+            prev_rank = group_ranks[rank - 1]
+            top_row = top_row_ref.contiguous(
+                memory_format=_halo_memory_format(top_row_ref)
+            )
+            p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
+            p2p_ops.append(dist.P2POp(dist.isend, top_row, prev_rank, group))
+        if rank < world_size - 1:
+            next_rank = group_ranks[rank + 1]
+            bottom_row = bottom_row_ref.contiguous(
+                memory_format=_halo_memory_format(bottom_row_ref)
+            )
+            p2p_ops.append(dist.P2POp(dist.isend, bottom_row, next_rank, group))
+            p2p_ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, next_rank, group))
 
     if p2p_ops:
         reqs = dist.batch_isend_irecv(p2p_ops)
@@ -369,6 +383,32 @@ def halo_exchange(
         recv_top_buf,
         recv_bottom_buf,
     )
+
+
+def _gather_neighbor_halos(
+    top_row: torch.Tensor,
+    bottom_row: torch.Tensor,
+    recv_top_buf: torch.Tensor,
+    recv_bottom_buf: torch.Tensor,
+    decode_group,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Halo exchange for platforms with collectives only.
+
+    Every rank gathers all edge rows and keeps its neighbors'. The edges are a
+    few rows, so the extra traffic is small next to the convolution.
+    """
+    height_halo_size = top_row.shape[-2]
+    edges = decode_group.all_gather(
+        torch.cat([top_row, bottom_row], dim=-2).contiguous(),
+        dim=0,
+        separate_tensors=True,
+    )
+    if rank > 0:
+        recv_top_buf.copy_(edges[rank - 1][..., height_halo_size:, :])
+    if rank < world_size - 1:
+        recv_bottom_buf.copy_(edges[rank + 1][..., :height_halo_size, :])
 
 
 def _make_boundary_halo(

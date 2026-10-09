@@ -116,6 +116,9 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         self.use_parallel_tiling = config.use_parallel_tiling
         self.use_parallel_decode = config.use_parallel_decode
         self.parallel_decode_mode = config.parallel_decode_mode
+        self.auto_parallel_decode_shards_without_p2p = (
+            config.auto_parallel_decode_shards_without_p2p()
+        )
 
     @property
     def device(self):

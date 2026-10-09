@@ -1,4 +1,6 @@
+import threading
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -25,13 +27,16 @@ from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.distributed.utils import RankGenerator
+from sglang.multimodal_gen.runtime.layers import parallel_conv
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelCausalConv3d,
     SpatialParallelConv2d,
     SpatialParallelConv3d,
     chunk_height_by_sizes,
+    disable_spatial_parallel_decode,
     split_for_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes import wanvae
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage import (
     QwenImageAttentionBlock,
@@ -50,8 +55,14 @@ from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
     _enable_ltx_decoder_spatial_parallel,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+    WanCausalConv3d,
     WanDecoder3d,
     WanDistAttentionBlock,
+    WanEncoder3d,
+    feat_idx,
+    first_chunk,
+    forward_context,
+    split_for_parallel_encode,
 )
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
@@ -76,6 +87,126 @@ class _DispatchProbeVAE(ParallelTiledVAE):
         )
 
 
+_thread_rank = threading.local()
+
+
+class _ThreadedDecodeGroup:
+    """Decode group stand-in that runs one thread per rank."""
+
+    def __init__(self, world_size: int):
+        self.world_size = world_size
+        self.ranks = list(range(world_size))
+        self.device_group = None
+        # A rank-divergent collective sequence fails instead of hanging.
+        self.barrier = threading.Barrier(world_size, timeout=60)
+        self._slots = [None] * world_size
+
+    def _exchange(self, tensor):
+        self._slots[_thread_rank.value] = tensor.clone()
+        self.barrier.wait()
+        gathered = list(self._slots)
+        self.barrier.wait()
+        return gathered
+
+    def all_gather(self, input_, dim=0, separate_tensors=False):
+        gathered = self._exchange(input_)
+        return gathered if separate_tensors else torch.cat(gathered, dim=dim)
+
+    def gather_height_sizes(self, x):
+        return [int(h) for h in self._exchange(torch.tensor(x.shape[-2]))]
+
+
+@contextmanager
+def _collectives_only_decode_group(world_size: int):
+    """Patch the decode group with ``world_size`` thread ranks and no p2p."""
+    group = _ThreadedDecodeGroup(world_size)
+    with (
+        patch.object(
+            parallel_conv, "get_decode_parallel_group_coordinator", lambda: group
+        ),
+        patch.object(
+            parallel_conv, "get_decode_parallel_rank", lambda: _thread_rank.value
+        ),
+        patch.object(
+            parallel_conv, "get_decode_parallel_world_size", lambda: world_size
+        ),
+        patch.object(parallel_conv, "gather_height_sizes", group.gather_height_sizes),
+        patch.object(
+            parallel_conv.current_platform,
+            "supports_distributed_p2p",
+            return_value=False,
+        ),
+    ):
+        yield group
+
+
+def _run_on_thread_ranks(group: _ThreadedDecodeGroup, fn) -> list:
+    outputs = [None] * group.world_size
+    errors = []
+
+    def run(rank):
+        _thread_rank.value = rank
+        try:
+            outputs[rank] = fn(rank)
+        except BaseException as e:
+            errors.append(e)
+            group.barrier.abort()
+
+    threads = [threading.Thread(target=run, args=(r,)) for r in range(group.world_size)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]
+    return outputs
+
+
+def _run_height_sharded_without_p2p(make_conv, x: torch.Tensor, world_size: int):
+    """Run one conv per rank on height shards, as a collectives-only platform does."""
+    shards = torch.tensor_split(x, world_size, dim=-2)
+    with _collectives_only_decode_group(world_size) as group:
+        _thread_rank.value = 0
+        reference_conv = make_conv()
+        with disable_spatial_parallel_decode():
+            expected = reference_conv(x)
+        convs = []
+        for rank in range(world_size):
+            _thread_rank.value = rank
+            conv = make_conv()
+            conv.load_state_dict(reference_conv.state_dict())
+            convs.append(conv)
+        outputs = _run_on_thread_ranks(group, lambda r: convs[r](shards[r]))
+    return torch.cat(outputs, dim=-2), expected
+
+
+def _encode_wan_video(encoder, x: torch.Tensor) -> torch.Tensor:
+    num_convs = sum(
+        isinstance(m, (WanCausalConv3d, SpatialParallelCausalConv3d))
+        for m in encoder.modules()
+    )
+    outputs = []
+    with forward_context(feat_cache_arg=[None] * num_convs, feat_idx_arg=0):
+        for start, end in [(0, 1)] + [(s, s + 4) for s in range(1, x.shape[2], 4)]:
+            feat_idx.set(0)
+            outputs.append(encoder(x[:, :, start:end]))
+    return torch.cat(outputs, dim=2)
+
+
+def _decode_wan_latents(decoder, z: torch.Tensor) -> torch.Tensor:
+    num_convs = sum(
+        isinstance(m, (WanCausalConv3d, SpatialParallelCausalConv3d))
+        for m in decoder.modules()
+    )
+    outputs = []
+    with forward_context(feat_cache_arg=[None] * num_convs, feat_idx_arg=0):
+        for i in range(z.shape[2]):
+            feat_idx.set(0)
+            first_chunk.set(i == 0)
+            outputs.append(decoder(z[:, :, i : i + 1]))
+    return torch.cat(outputs, dim=2)
+
+
 class TestVAESpatialParallelDecode(unittest.TestCase):
     def test_image_video_vae_configs_default_to_auto_parallel_decode(self):
         configs = (
@@ -96,7 +227,10 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 self.assertTrue(config.use_parallel_decode)
                 self.assertEqual(config.parallel_decode_mode, "auto")
 
-    def test_auto_parallel_decode_policy_is_conservative(self):
+    @patch("sglang.multimodal_gen.configs.models.vaes.base.current_platform")
+    def test_auto_parallel_decode_policy_is_conservative(self, platform):
+        # With p2p halos; test_tpu_platform covers auto mode without p2p.
+        platform.supports_distributed_p2p.return_value = True
         self.assertFalse(is_spatial_shard_parallel_decode_mode("auto"))
         self.assertFalse(should_use_spatial_shard_parallel_decode(VAEConfig()))
         self.assertFalse(should_use_spatial_shard_parallel_decode(QwenImageVAEConfig()))
@@ -283,6 +417,114 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertEqual(rank0.shape[-2], 6)
         self.assertEqual(rank1.shape[-2], 4)
         torch.testing.assert_close(torch.cat([rank0, rank1], dim=-2), x)
+
+    def test_collective_halo_exchange_matches_unsharded_conv(self):
+        torch.manual_seed(0)
+        cases = [
+            (SpatialParallelConv2d, torch.randn(1, 4, 10, 7)),
+            (SpatialParallelCausalConv3d, torch.randn(1, 4, 3, 10, 7)),
+        ]
+        for conv_cls, x in cases:
+            make_conv = lambda: conv_cls(4, 5, 3, padding=1)
+            for world_size in (2, 3, 4):
+                with self.subTest(conv=conv_cls.__name__, world=world_size):
+                    actual, expected = _run_height_sharded_without_p2p(
+                        make_conv, x, world_size
+                    )
+                    torch.testing.assert_close(actual, expected)
+
+    def test_wan_decoder_shards_height_without_p2p(self):
+        def build(use_parallel_decode):
+            return WanDecoder3d(
+                dim=8,
+                z_dim=4,
+                dim_mult=(1, 2, 2),
+                num_res_blocks=1,
+                attn_scales=(),
+                temperal_upsample=(True, False),
+                out_channels=3,
+                use_parallel_decode=use_parallel_decode,
+            ).eval()
+
+        torch.manual_seed(0)
+        world_size = 3
+        reference = build(False)
+        z = torch.randn(1, 4, 3, 10, 6)
+        with torch.no_grad():
+            expected = _decode_wan_latents(reference, z)
+
+        with (
+            _collectives_only_decode_group(world_size) as group,
+            patch.object(wanvae.dist, "is_initialized", return_value=True),
+            patch.object(wanvae, "get_decode_parallel_world_size", lambda: world_size),
+            patch.object(
+                wanvae, "get_decode_parallel_rank", lambda: _thread_rank.value
+            ),
+        ):
+            decoders = []
+            for rank in range(world_size):
+                _thread_rank.value = rank
+                decoder = build(True)
+                decoder.load_state_dict(reference.state_dict())
+                decoders.append(decoder)
+            with torch.no_grad():
+                outputs = _run_on_thread_ranks(
+                    group, lambda r: _decode_wan_latents(decoders[r], z)
+                )
+
+        for output in outputs:
+            torch.testing.assert_close(output, expected)
+
+    def test_wan_encoder_shards_height_without_p2p(self):
+        def build(use_parallel_encode):
+            return WanEncoder3d(
+                dim=8,
+                z_dim=4,
+                dim_mult=(1, 2, 2),
+                num_res_blocks=1,
+                temperal_downsample=(True, False),
+                use_parallel_encode=use_parallel_encode,
+            ).eval()
+
+        torch.manual_seed(0)
+        world_size = 3
+        reference = build(False)
+        # 10 blocks of 4 rows split 4/3/3, so the shards are uneven.
+        x = torch.randn(1, 3, 5, 40, 8)
+        with torch.no_grad():
+            expected = _encode_wan_video(reference, x)
+
+        with (
+            _collectives_only_decode_group(world_size) as group,
+            patch.object(wanvae.dist, "is_initialized", return_value=True),
+            patch.object(wanvae, "get_decode_parallel_world_size", lambda: world_size),
+            patch.object(
+                wanvae, "get_decode_parallel_rank", lambda: _thread_rank.value
+            ),
+        ):
+            encoders = []
+            for rank in range(world_size):
+                _thread_rank.value = rank
+                encoder = build(True)
+                encoder.load_state_dict(reference.state_dict())
+                encoders.append(encoder)
+            with torch.no_grad():
+                outputs = _run_on_thread_ranks(
+                    group, lambda r: _encode_wan_video(encoders[r], x)
+                )
+
+        for output in outputs:
+            torch.testing.assert_close(output, expected)
+
+    def test_wan_encode_split_keeps_whole_downsampling_blocks(self):
+        x = torch.arange(40).view(1, 1, 1, 40, 1)
+        shards = [split_for_parallel_encode(x, 3, 3, rank) for rank in range(3)]
+        self.assertEqual([shard.shape[-2] for shard, _ in shards], [16, 16, 8])
+        self.assertEqual({height for _, height in shards}, {5})
+        torch.testing.assert_close(torch.cat([s for s, _ in shards], dim=-2), x)
+        # Heights that are not whole blocks, or too few blocks, stay unsplit.
+        self.assertIsNone(split_for_parallel_encode(x[..., :36, :], 3, 3, 0))
+        self.assertIsNone(split_for_parallel_encode(x[..., :16, :], 3, 3, 0))
 
     def test_qwen_decoder_uses_spatial_parallel_components(self):
         with (
