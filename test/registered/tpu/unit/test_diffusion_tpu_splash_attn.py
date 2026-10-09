@@ -53,6 +53,17 @@ def _rel_l2(got, want):
     return ((got.float() - want).norm() / want.norm()).item()
 
 
+def _reference_lse(q, k, scale):
+    """float32 natural-log log-sum-exp of the scaled scores, [B, H, S]."""
+    return torch.logsumexp(
+        torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale, dim=-1
+    )
+
+
+def _kv_info(row_offset, real_keys):
+    return torch.tensor([row_offset, real_keys], dtype=torch.int32).to("tpu")
+
+
 def _inputs(
     batch,
     heads,
@@ -317,6 +328,197 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
             ).transpose(1, 2)[0]
             self.assertLess((got[seg].float() - want).abs().max().item(), 2e-2)
             start += n
+
+    def test_lse_matches_reference(self):
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
+            tpu_attention_with_lse,
+        )
+
+        scale = 128**-0.5
+        for batch, heads, q_seq, kv_seq in ((1, 2, 4608, 4608), (2, 2, 880, 4128)):
+            with self.subTest(q_seq=q_seq, kv_seq=kv_seq):
+                q, k, v = _inputs(batch, heads, q_seq, kv_seq)
+                want = _reference(q, k, v, scale, False)
+                want_lse = _reference_lse(q, k, scale)
+                out, lse = tpu_attention_with_lse(
+                    q.to("tpu"), k.to("tpu"), v.to("tpu"), scale
+                )
+                out, lse = out.to("cpu"), lse.to("cpu")
+                self.assertEqual(lse.shape, want_lse.shape)
+                self.assertEqual(lse.dtype, torch.float32)
+                self.assertLess((out.float() - want).abs().max().item(), 2e-2)
+                self.assertLess((lse - want_lse).abs().max().item(), 2e-2)
+
+    def test_impl_returns_softmax_lse(self):
+        # The ring merge's contract: [b, s, h, d] output, [b, h, s] LSE.
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
+            TpuSplashAttentionImpl,
+        )
+
+        impl = TpuSplashAttentionImpl(
+            num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5
+        )
+        q, k, v = _inputs(1, 2, 4608, 4608)
+        out, lse = impl.forward(
+            *(t.transpose(1, 2).to("tpu") for t in (q, k, v)),
+            None,
+            return_softmax_lse=True,
+        )
+        want = _reference(q, k, v, 128**-0.5, False).transpose(1, 2)
+        self.assertEqual(out.shape, want.shape)
+        self.assertLess((out.to("cpu").float() - want).abs().max().item(), 2e-2)
+        want_lse = _reference_lse(q, k, 128**-0.5)
+        self.assertLess((lse.to("cpu") - want_lse).abs().max().item(), 2e-2)
+
+    def test_ring_step_skips_keys_past_the_real_count(self):
+        # Keys past the real count are sequence-parallel padding; NaN there
+        # proves they never contribute.
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
+            tpu_ring_attention_step,
+        )
+
+        scale = 128**-0.5
+        for q_seq, kv_seq, real in ((4608, 4624, 4600), (2048, 8192, 6150)):
+            with self.subTest(kv_seq=kv_seq, real=real):
+                q, k, v = _inputs(1, 2, q_seq, kv_seq)
+                k[:, :, real:], v[:, :, real:] = float("nan"), float("nan")
+                want = _reference(q, k[:, :, :real], v[:, :, :real], scale, False)
+                out, carry = tpu_ring_attention_step(
+                    q.to("tpu"),
+                    k.to("tpu"),
+                    v.to("tpu"),
+                    _kv_info(0, real),
+                    None,
+                    scale,
+                )
+                out = out.to("cpu").float()
+                self.assertFalse(torch.isnan(out).any().item())
+                self.assertFalse(torch.isnan(carry[1].to("cpu")).any().item())
+                self.assertLess((out - want).abs().max().item(), 2e-2)
+
+    def test_ring_step_resumes_an_earlier_partial(self):
+        # Two key halves, the second step resuming the first, equal attention
+        # over all keys.
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
+            tpu_ring_attention_step,
+        )
+
+        scale = 128**-0.5
+        q, k, v = _inputs(1, 2, 4608, 2 * 4600)
+        want = _reference(q, k, v, scale, False)
+        qt = q.to("tpu")
+        halves = [(t[:, :, :4600].to("tpu"), t[:, :, 4600:].to("tpu")) for t in (k, v)]
+        _, carry = tpu_ring_attention_step(
+            qt, halves[0][0], halves[1][0], _kv_info(0, 4600), None, scale
+        )
+        out, _ = tpu_ring_attention_step(
+            qt, halves[0][1], halves[1][1], _kv_info(0, 4600), carry, scale
+        )
+        self.assertLess((out.to("cpu").float() - want).abs().max().item(), 2e-2)
+
+    def test_ring_step_picks_shard_and_key_count_at_run_time(self):
+        # Stacked shards with batch 2 and GQA: the row offset and real-key
+        # count arrive as data, resuming the local shard's softmax, as the
+        # padded ring does. NaN past the real keys proves they are unused.
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
+            tpu_ring_attention_step,
+        )
+
+        scale = 128**-0.5
+        batch, heads, kv_heads, shard_len = 2, 4, 2, 4624
+        gen = torch.Generator().manual_seed(0)
+
+        def randn(*shape):
+            return torch.randn(shape, generator=gen).bfloat16()
+
+        q = randn(batch, heads, 4608, 128)
+        k_local, v_local = (
+            randn(batch, kv_heads, shard_len, 128),
+            randn(batch, kv_heads, shard_len, 128),
+        )
+        k_stack, v_stack = (
+            randn(2 * batch, kv_heads, shard_len, 128),
+            randn(2 * batch, kv_heads, shard_len, 128),
+        )
+        for peer, real in ((0, shard_len), (1, 4600), (1, 2100)):
+            with self.subTest(peer=peer, real=real):
+                kk, vv = k_stack.clone(), v_stack.clone()
+                rows = slice(peer * batch, (peer + 1) * batch)
+                kk[rows, :, real:], vv[rows, :, real:] = float("nan"), float("nan")
+                keys = torch.cat([k_local, kk[rows, :, :real]], dim=2)
+                values = torch.cat([v_local, vv[rows, :, :real]], dim=2)
+                want = _reference(
+                    q,
+                    keys.repeat_interleave(heads // kv_heads, 1),
+                    values.repeat_interleave(heads // kv_heads, 1),
+                    scale,
+                    False,
+                )
+                qt = q.to("tpu")
+                _, carry = tpu_ring_attention_step(
+                    qt,
+                    k_local.to("tpu"),
+                    v_local.to("tpu"),
+                    _kv_info(0, shard_len),
+                    None,
+                    scale,
+                )
+                out, _ = tpu_ring_attention_step(
+                    qt,
+                    kk.to("tpu"),
+                    vv.to("tpu"),
+                    _kv_info(peer * batch * kv_heads, real),
+                    carry,
+                    scale,
+                )
+                out = out.to("cpu").float()
+                self.assertFalse(torch.isnan(out).any().item())
+                self.assertLess((out - want).abs().max().item(), 2e-2)
+
+    def test_ring_step_over_an_empty_shard_resumes_exactly(self):
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
+            tpu_ring_attention_step,
+        )
+
+        scale = 128**-0.5
+        q, k, v = _inputs(1, 2, 4608, 4608)
+        qt, kt, vt = q.to("tpu"), k.to("tpu"), v.to("tpu")
+        empty_out, carry = tpu_ring_attention_step(
+            qt, kt, vt, _kv_info(0, 0), None, scale
+        )
+        self.assertTrue(torch.all(empty_out.to("cpu") == 0))
+        out, _ = tpu_ring_attention_step(qt, kt, vt, _kv_info(0, 4608), carry, scale)
+        want = _reference(q, k, v, scale, False)
+        self.assertLess((out.to("cpu").float() - want).abs().max().item(), 2e-2)
+
+    def test_ring_step_under_torch_compile(self):
+        import torch_tpu._internal.compile  # noqa: F401
+
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
+            _register_ops,
+            tpu_ring_attention_step,
+        )
+
+        _register_ops()
+        scale = 128**-0.5
+
+        def two_steps(q, k, v, info_a, info_b):
+            _, carry = tpu_ring_attention_step(q, k, v, info_a, None, scale)
+            out, _ = tpu_ring_attention_step(q, k, v, info_b, carry, scale)
+            return out
+
+        q, k, v = _inputs(1, 2, 4608, 2 * 4608)
+        stacked = [torch.cat(t.chunk(2, dim=2), dim=0) for t in (k, v)]
+        want = _reference(q, k, v, scale, False)
+        compiled = torch.compile(two_steps, backend="tpu", dynamic=False)
+        got = compiled(
+            q.to("tpu"),
+            stacked[0].to("tpu"),
+            stacked[1].to("tpu"),
+            _kv_info(0, 4608),
+            _kv_info(2, 4608),
+        ).to("cpu")
+        self.assertLess((got.float() - want).abs().max().item(), 2e-2)
 
     def test_backend_impl_layout(self):
         # The attention layer calls the impl with [B, S, H, D] tensors.

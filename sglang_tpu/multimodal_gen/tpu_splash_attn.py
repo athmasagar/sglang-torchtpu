@@ -13,6 +13,7 @@ import functools
 import math
 import threading
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -28,6 +29,8 @@ logger = init_logger(__name__)
 LOG2_E = math.log2(math.e)
 NUM_SUBLANES = 8
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))
+# Finite stand-in for -inf scores: exp2 of it is 0 without inf - inf.
+_MASK_VALUE = -0.7 * float(np.finfo(np.float32).max)
 # Block sizes and the VMEM model below are tuned and validated on v7x only.
 _SUPPORTED_PALLAS_DEVICE_KINDS = frozenset({"TPU7x"})
 
@@ -35,6 +38,7 @@ _SPLASH_AVAILABLE: bool | None = None
 _logged_sdpa_fallbacks: set[tuple] = set()
 
 _FLASH_OP = None
+_FLASH_RING_OP = None
 _SPLASH_MHA_OP = None
 _OPS_LOCK = threading.Lock()
 _resolved_mode_logged = False
@@ -77,7 +81,9 @@ def _check_splash_available() -> bool:
             raise RuntimeError(f"kernels are tuned for TPU v7x only, not {device_kind}")
         _SPLASH_AVAILABLE = True
     except Exception as exc:
-        logger.warning("TPU Pallas splash attention unavailable (%s); using SDPA.", exc)
+        logger.warning(
+            "TPU Pallas splash attention unavailable (%s); using XLA attention.", exc
+        )
         _SPLASH_AVAILABLE = False
     return _SPLASH_AVAILABLE
 
@@ -200,12 +206,32 @@ def _splash_mha_block_sizes(
     return 256, 256
 
 
-def _flash_attention(q, k, v, scale):
-    """Flash attention with an online exp2 softmax on ``[B, H, S, D]`` arrays.
+def _flash_call(
+    q_seq: int,
+    kv_seq: int,
+    head_dim: int,
+    scale: float,
+    *,
+    num_rows: int,
+    heads: int,
+    kv_heads: int,
+    out_dtype,
+    return_lse: bool = False,
+    resume: bool = False,
+    runtime_kv: bool = False,
+):
+    """``pallas_call`` of the flash kernel over ``[rows, S, D]`` arrays.
 
-    Takes the unscaled query: the softmax scale is applied to the float32
-    scores. Inputs are not padded; Mosaic masks the ragged query edge block and
-    the last KV block reads only real keys.
+    Query row ``h`` is (batch ``h // heads``, head ``h % heads``); it reads KV
+    row ``(h // heads) * kv_heads + head // (heads // kv_heads)``.
+
+    - ``return_lse``: also return the base-2 log-sum-exp of the scaled scores,
+      ``[rows, NUM_SUBLANES, q_seq]`` float32 with identical sublane rows.
+    - ``resume``: two more inputs, the output and base-2 log-sum-exp of
+      attention over other keys; the softmax continues from them.
+    - ``runtime_kv``: a leading int32 ``[row offset, real keys]`` input read at
+      run time: KV rows shift by ``offset`` and only their first ``real keys``
+      keys count. A rank-dependent shard choice then compiles one program.
     """
     import jax
     import jax.numpy as jnp
@@ -213,9 +239,7 @@ def _flash_attention(q, k, v, scale):
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
-    num_q_heads, q_seq, head_dim = q.shape[1:]
-    num_kv_heads, kv_seq = k.shape[1], k.shape[2]
-    q_heads_per_kv_head = num_q_heads // num_kv_heads
+    q_heads_per_kv_head = heads // kv_heads
     # One VMEM figure feeds both the block-size model and Mosaic's limit.
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     block_q, block_kv, block_kv_compute = _autotune_block_sizes(
@@ -223,32 +247,54 @@ def _flash_attention(q, k, v, scale):
     )
     grid_width = pl.cdiv(kv_seq, block_kv)
     qk_scale = scale * LOG2_E
-    mask_value = -0.7 * float(jnp.finfo(jnp.float32).max)
     logger.info(
-        "TPU splash attention: q_seq=%d kv_seq=%d -> flash kernel blocks=%s",
+        "TPU splash attention: q_seq=%d kv_seq=%d -> flash kernel blocks=%s%s",
         q_seq,
         kv_seq,
         (block_q, block_kv, block_kv_compute),
+        " (ring)" if runtime_kv else "",
     )
 
-    def kernel(q_ref, k_ref, v_ref, o_ref, m_scratch_ref, l_scratch_ref, o_scratch_ref):
+    def kernel(*refs):
+        if runtime_kv:
+            kv_info_ref, *refs = refs
+        q_ref, k_ref, v_ref, *refs = refs
+        if resume:
+            o_prev_ref, lse_prev_ref, *refs = refs
+        o_ref, *refs = refs
+        if return_lse:
+            lse_ref, *refs = refs
+        m_scratch_ref, l_scratch_ref, o_scratch_ref = refs
         float32 = jnp.float32
         sv_dims = (((0,), (0,)), ((), ()))
         j = pl.program_id(2)
 
         @pl.when(j == 0)
         def init():
-            o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
-            l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
-            m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
+            if resume:
+                # The earlier keys enter as one pseudo-key with score lse_prev
+                # and value o_prev: sum(exp2(s) v) = exp2(lse_prev) o_prev.
+                o_scratch_ref[...] = o_prev_ref[...].astype(float32).T
+                l_scratch_ref[...] = jnp.ones_like(l_scratch_ref)
+                m_scratch_ref[...] = lse_prev_ref[...]
+            else:
+                o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
+                l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+                m_scratch_ref[...] = jnp.full_like(m_scratch_ref, _MASK_VALUE)
 
-        def update(slice_k):
+        def update(slice_k, real=None):
             q_tile = q_ref[...]
             k_chunk = k_ref[slice_k, :]
             v_chunk = v_ref[slice_k, :]
             qk = lax.dot_general(
                 k_chunk, q_tile, NT_DIM_NUMBERS, preferred_element_type=float32
             )
+            if real is not None:
+                # Rows from `real` on are padding or past the array: drop their
+                # scores and zero their values (they may hold NaN).
+                rows = lax.broadcasted_iota(jnp.int32, (qk.shape[0], 1), 0)
+                qk = jnp.where(rows < real, qk, _MASK_VALUE)
+                v_chunk = jnp.where(rows < real, v_chunk, jnp.zeros_like(v_chunk))
             m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
             # Max of raw scores (qk_scale > 0): qk * c - m is one FMA.
             m_curr = qk.max(axis=0)[None, :] * qk_scale
@@ -268,60 +314,199 @@ def _flash_attention(q, k, v, scale):
         def compute_body(kv_compute_index, _):
             update(pl.ds(kv_compute_index * block_kv_compute, block_kv_compute))
 
-        @pl.when(j != grid_width - 1)
-        def body():
-            lax.fori_loop(
-                0, block_kv // block_kv_compute, compute_body, None, unroll=True
-            )
-
-        # The last KV block reads only real keys.
-        @pl.when(j == grid_width - 1)
         def last_body():
+            # The ragged last KV block: read only the keys the array holds.
             remain = kv_seq - (grid_width - 1) * block_kv
             full, tail = divmod(remain, block_kv_compute)
             lax.fori_loop(0, full, compute_body, None, unroll=True)
             if tail:
                 update(pl.ds(full * block_kv_compute, tail))
 
+        if runtime_kv:
+            real_keys = kv_info_ref[1]
+            start = j * block_kv
+
+            @pl.when(start + block_kv <= real_keys)
+            def body():
+                lax.fori_loop(
+                    0, block_kv // block_kv_compute, compute_body, None, unroll=True
+                )
+
+            if kv_seq % block_kv:
+                # A shard without padding takes the static ragged tail.
+                pl.when((j == grid_width - 1) & (real_keys == kv_seq))(last_body)
+
+            # In a padded shard, the block holding the last real key masks the
+            # rest; blocks past it are skipped.
+            @pl.when(
+                (start < real_keys)
+                & (start + block_kv > real_keys)
+                & (real_keys < kv_seq)
+            )
+            def edge_body():
+                for c in range(block_kv // block_kv_compute):
+                    chunk_start = start + c * block_kv_compute
+
+                    @pl.when(chunk_start < real_keys)
+                    def _():
+                        update(
+                            pl.ds(c * block_kv_compute, block_kv_compute),
+                            real=real_keys - chunk_start,
+                        )
+
+        else:
+
+            @pl.when(j != grid_width - 1)
+            def body():
+                lax.fori_loop(
+                    0, block_kv // block_kv_compute, compute_body, None, unroll=True
+                )
+
+            pl.when(j == grid_width - 1)(last_body)
+
         @pl.when(j == grid_width - 1)
         def end():
+            # No real keys (an all-padding shard) leaves l == 0: output 0 and a
+            # _MASK_VALUE log-sum-exp, which a later resume treats exactly.
+            l = l_scratch_ref[...]
+            l_safe = jnp.where(l > 0, l, 1.0)
             # l is replicated across the sublanes; tile it to the [D, block_q]
             # scratch and write the [block_q, D] output tile.
-            l_inv = jnp.tile(1.0 / l_scratch_ref[...], (head_dim // NUM_SUBLANES, 1))
+            l_inv = jnp.tile(1.0 / l_safe, (head_dim // NUM_SUBLANES, 1))
             o_ref[...] = (o_scratch_ref[...] * l_inv).T.astype(o_ref.dtype)
+            if return_lse:
+                lse_ref[...] = jnp.where(
+                    l > 0, m_scratch_ref[...] + jnp.log2(l_safe), _MASK_VALUE
+                )
 
-    def attend(q_3d, k_3d, v_3d):
-        kv_spec = pl.BlockSpec(
-            (None, block_kv, head_dim),
-            lambda h, i, j: (h // q_heads_per_kv_head, j, 0),
-        )
+    def q_index(h, i, j, *_):
+        return (h, i, 0)
+
+    def kv_index(h, i, j, *scalars):
+        row = (h // heads) * kv_heads + (h % heads) // q_heads_per_kv_head
+        return (row + scalars[0][0] if scalars else row, j, 0)
+
+    def lse_index(h, i, j, *_):
+        return (h, 0, i)
+
+    in_specs = [
+        pl.BlockSpec((None, block_q, head_dim), q_index),
+        pl.BlockSpec((None, block_kv, head_dim), kv_index),
+        pl.BlockSpec((None, block_kv, head_dim), kv_index),
+    ]
+    if resume:
+        in_specs += [
+            pl.BlockSpec((None, block_q, head_dim), q_index),
+            pl.BlockSpec((None, NUM_SUBLANES, block_q), lse_index),
+        ]
+    out_specs = pl.BlockSpec((None, block_q, head_dim), q_index)
+    out_shape = jax.ShapeDtypeStruct((num_rows, q_seq, head_dim), out_dtype)
+    if return_lse:
+        out_specs = [out_specs, pl.BlockSpec((None, NUM_SUBLANES, block_q), lse_index)]
+        out_shape = [
+            out_shape,
+            jax.ShapeDtypeStruct((num_rows, NUM_SUBLANES, q_seq), jnp.float32),
+        ]
+    grid = (num_rows, pl.cdiv(q_seq, block_q), grid_width)
+    scratch_shapes = [
+        pltpu.VMEM((NUM_SUBLANES, block_q), jnp.float32),
+        pltpu.VMEM((NUM_SUBLANES, block_q), jnp.float32),
+        pltpu.VMEM((head_dim, block_q), jnp.float32),
+    ]
+    compiler_params = pltpu.CompilerParams(
+        dimension_semantics=("parallel", "parallel", "arbitrary"),
+        flags={"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True},
+        # Autotuned score tiles exceed Mosaic's 32 MiB default.
+        vmem_limit_bytes=vmem_capacity_bytes,
+    )
+    name = (
+        "diffusion_flash_attention_ring" if runtime_kv else "diffusion_flash_attention"
+    )
+    if runtime_kv:
         return pl.pallas_call(
             kernel,
-            grid=(num_q_heads, pl.cdiv(q_seq, block_q), grid_width),
-            in_specs=[
-                pl.BlockSpec((None, block_q, head_dim), lambda h, i, j: (h, i, 0)),
-                kv_spec,
-                kv_spec,
-            ],
-            out_specs=pl.BlockSpec(
-                (None, block_q, head_dim), lambda h, i, j: (h, i, 0)
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                grid=grid,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                scratch_shapes=scratch_shapes,
             ),
-            scratch_shapes=[
-                pltpu.VMEM((NUM_SUBLANES, block_q), jnp.float32),
-                pltpu.VMEM((NUM_SUBLANES, block_q), jnp.float32),
-                pltpu.VMEM((head_dim, block_q), jnp.float32),
-            ],
-            compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("parallel", "parallel", "arbitrary"),
-                flags={"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True},
-                # Autotuned score tiles exceed Mosaic's 32 MiB default.
-                vmem_limit_bytes=vmem_capacity_bytes,
-            ),
-            out_shape=jax.ShapeDtypeStruct((num_q_heads, q_seq, head_dim), q_3d.dtype),
-            name="diffusion_flash_attention",
-        )(q_3d, k_3d, v_3d)
+            compiler_params=compiler_params,
+            out_shape=out_shape,
+            name=name,
+        )
+    return pl.pallas_call(
+        kernel,
+        grid=grid,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        scratch_shapes=scratch_shapes,
+        compiler_params=compiler_params,
+        out_shape=out_shape,
+        name=name,
+    )
 
-    return jax.vmap(attend)(q, k, v)
+
+def _flash_attention(q, k, v, scale):
+    """Flash attention with an online exp2 softmax on ``[B, H, S, D]`` arrays.
+
+    Takes the unscaled query: the softmax scale is applied to the float32
+    scores. Inputs are not padded; Mosaic masks the ragged query edge block and
+    the last KV block reads only real keys.
+    """
+    import jax
+
+    heads, q_seq, head_dim = q.shape[1:]
+    call = _flash_call(
+        q_seq,
+        k.shape[2],
+        head_dim,
+        scale,
+        num_rows=heads,
+        heads=heads,
+        kv_heads=k.shape[1],
+        out_dtype=q.dtype,
+    )
+    return jax.vmap(call)(q, k, v)
+
+
+def _flash_attention_ring(q, k, v, kv_info, out_prev, lse_prev, scale):
+    """One ring step of flash attention with a run-time KV shard choice.
+
+    ``q`` is ``[B, H, S, D]``; ``k``/``v`` stack shards ``[N, H_kv, S_kv, D]``
+    (``N >= B``), and ``kv_info`` = int32 ``[row offset, real keys]`` picks KV
+    rows ``offset .. offset + B * H_kv`` of the batch-flattened stack (``None``:
+    ``k``/``v`` are ``[B, H_kv, S_kv, D]`` and every key counts). With
+    ``out_prev``/``lse_prev`` the softmax resumes from earlier shards. Returns
+    the output and base-2 log-sum-exp ``[B, H, NUM_SUBLANES, S]`` float32.
+    """
+    batch, heads, q_seq, head_dim = q.shape
+    resume = out_prev is not None
+    runtime_kv = kv_info is not None
+    call = _flash_call(
+        q_seq,
+        k.shape[2],
+        head_dim,
+        scale,
+        num_rows=batch * heads,
+        heads=heads,
+        kv_heads=k.shape[1],
+        out_dtype=q.dtype,
+        return_lse=True,
+        resume=resume,
+        runtime_kv=runtime_kv,
+    )
+
+    # The offset may address any batch row of the stack, so batch folds into
+    # the row axis instead of being mapped over.
+    def flat(t):
+        return t.reshape(-1, *t.shape[2:])
+
+    info = (kv_info,) if runtime_kv else ()
+    prev = (flat(out_prev), flat(lse_prev)) if resume else ()
+    out, lse = call(*info, flat(q), flat(k), flat(v), *prev)
+    return out.reshape(q.shape), lse.reshape(batch, heads, NUM_SUBLANES, q_seq)
 
 
 def _splash_mha(q, k, v, scale, is_causal):
@@ -394,7 +579,7 @@ def _register_ops() -> None:
     A failure marks the kernels unavailable, so callers fall back to SDPA
     instead of retrying a half-registered ``torch.library`` op.
     """
-    global _FLASH_OP, _SPLASH_MHA_OP, _SPLASH_AVAILABLE
+    global _FLASH_OP, _FLASH_RING_OP, _SPLASH_MHA_OP, _SPLASH_AVAILABLE
     if _FLASH_OP is not None or _SPLASH_AVAILABLE is False:
         return
     with _OPS_LOCK:
@@ -410,6 +595,19 @@ def _register_ops() -> None:
             ) -> jax.Array:
                 return _flash_attention(q, k, v, scale)
 
+            def flash_ring(
+                q: jax.Array,
+                k: jax.Array,
+                v: jax.Array,
+                kv_info: jax.Array | None,
+                out_prev: jax.Array | None,
+                lse_prev: jax.Array | None,
+                scale: float,
+            ) -> tuple[jax.Array, jax.Array]:
+                return _flash_attention_ring(
+                    q, k, v, kv_info, out_prev, lse_prev, scale
+                )
+
             def splash_mha(
                 q: jax.Array, k: jax.Array, v: jax.Array, scale: float, is_causal: bool
             ) -> jax.Array:
@@ -417,6 +615,13 @@ def _register_ops() -> None:
 
             def flash_fake(q, k, v, scale):
                 return q.new_empty(q.shape)
+
+            def flash_ring_fake(q, k, v, kv_info, out_prev, lse_prev, scale):
+                batch, heads, q_seq = q.shape[:3]
+                lse_shape = (batch, heads, NUM_SUBLANES, q_seq)
+                return q.new_empty(q.shape), q.new_empty(
+                    lse_shape, dtype=torch.float32
+                )
 
             def splash_mha_fake(q, k, v, scale, is_causal):
                 return q.new_empty(q.shape)
@@ -429,6 +634,10 @@ def _register_ops() -> None:
                 "sglang_tpu_pallas::diffusion_flash_attention", flash
             )
             flash_op.register_fake(flash_fake)
+            flash_ring_op = cpu_export_jax_op(
+                "sglang_tpu_pallas::diffusion_flash_attention_ring", flash_ring
+            )
+            flash_ring_op.register_fake(flash_ring_fake)
         except Exception as exc:
             logger.warning(
                 "TPU Pallas splash attention ops failed to register (%s); using SDPA.",
@@ -437,6 +646,7 @@ def _register_ops() -> None:
             _SPLASH_AVAILABLE = False
             return
         _SPLASH_MHA_OP = splash_mha_op
+        _FLASH_RING_OP = flash_ring_op
         _FLASH_OP = flash_op
 
 
@@ -531,12 +741,156 @@ def tpu_attention(
     )
 
 
+def _ring_kernel_fallback_reason(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> str | None:
+    if not _use_custom_kernel(query.shape[2], key.shape[2], False):
+        return "short"
+    return _sdpa_fallback_reason(query, key, value, False)
+
+
+# float32 score bytes per query chunk of the reference attention.
+_REFERENCE_SCORE_BYTES = 256 << 20
+
+
+def _attention_with_lse_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    *,
+    real_keys: torch.Tensor | int | None = None,
+    is_causal: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """float32 ``[B, H, S, D]`` attention and its natural-log LSE ``[B, H, S]``.
+
+    Query rows run in chunks, so the float32 scores stay bounded.
+    """
+    if query.shape[1] != key.shape[1]:
+        repeat = query.shape[1] // key.shape[1]
+        key = key.repeat_interleave(repeat, dim=1)
+        value = value.repeat_interleave(repeat, dim=1)
+    batch, heads, q_seq, _ = query.shape
+    kv_seq = key.shape[2]
+    key_t, value = key.float().transpose(-1, -2), value.float()
+    cols = torch.arange(kv_seq, device=query.device)
+    if real_keys is not None:
+        real = cols < real_keys
+        # Keys past the real count may hold NaN; they must add nothing.
+        value = torch.where(real[:, None], value, 0.0)
+    chunk = max(1, _REFERENCE_SCORE_BYTES // (4 * batch * heads * max(kv_seq, 1)))
+    outs, lses = [], []
+    for start in range(0, q_seq, chunk):
+        scores = torch.matmul(query[:, :, start : start + chunk].float(), key_t) * scale
+        if real_keys is not None:
+            scores = scores.masked_fill(~real, float("-inf"))
+        if is_causal:
+            rows = torch.arange(start, start + scores.shape[2], device=query.device)
+            scores = scores.masked_fill(cols > rows[:, None], float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1)
+        # Rows without a real key: output 0, log-sum-exp -inf.
+        probs = torch.exp(scores - lse[..., None]).nan_to_num(0.0)
+        outs.append(torch.matmul(probs, value))
+        lses.append(lse)
+    return torch.cat(outs, dim=2), torch.cat(lses, dim=2)
+
+
+def _merge_attention(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    out_prev: torch.Tensor,
+    lse_prev: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attention over two key sets from each set's output and natural-log LSE."""
+    peak = torch.maximum(lse, lse_prev)
+    peak = torch.where(torch.isinf(peak), torch.zeros_like(peak), peak)
+    w, w_prev = torch.exp(lse - peak), torch.exp(lse_prev - peak)
+    total = w + w_prev
+    merged = out.float() * w[..., None] + out_prev.float() * w_prev[..., None]
+    merged = merged / torch.where(total > 0, total, 1.0)[..., None]
+    return merged, peak + torch.log(total)
+
+
+def tpu_attention_with_lse(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    is_causal: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[B, H, S, D]`` attention and its natural-log log-sum-exp ``[B, H, S]``
+    float32, the ``return_softmax_lse`` contract of the ring merge."""
+    if not is_causal and _ring_kernel_fallback_reason(query, key, value) is None:
+        _register_ops()
+        out, lse2 = _FLASH_RING_OP(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            None,
+            None,
+            None,
+            scale,
+        )
+        return out, lse2[:, :, 0] * math.log(2.0)
+    if is_causal and query.shape[2] != key.shape[2]:
+        raise NotImplementedError("ragged causal attention with LSE")
+    out, lse = _attention_with_lse_reference(
+        query, key, value, scale, is_causal=is_causal
+    )
+    return out.to(query.dtype), lse
+
+
+def tpu_ring_attention_step(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_info: torch.Tensor,
+    carry: tuple[torch.Tensor, torch.Tensor] | None,
+    scale: float,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """One all-gather ring step; see ``AttentionImpl.forward_ring_resume``.
+
+    The kernel carries the bf16 output and base-2 log-sum-exp between steps
+    (one bf16 rounding of the partial output per step); shapes the kernel
+    does not take carry float32 output and natural-log LSE.
+    """
+    if _ring_kernel_fallback_reason(query, key, value) is None:
+        _register_ops()
+        out_prev, lse_prev = carry if carry is not None else (None, None)
+        out, lse2 = _FLASH_RING_OP(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            kv_info,
+            out_prev,
+            lse_prev,
+            scale,
+        )
+        return out, (out, lse2)
+    # Same shard selection as the kernel's index map, as device data.
+    batch, kv_heads = query.shape[0], key.shape[1]
+    rows = kv_info[0] + torch.arange(batch * kv_heads, device=key.device)
+    shard = (batch, kv_heads, *key.shape[2:])
+    key = key.reshape(-1, *key.shape[2:]).index_select(0, rows).view(shard)
+    value = value.reshape(-1, *value.shape[2:]).index_select(0, rows).view(shard)
+    out, lse = _attention_with_lse_reference(
+        query, key, value, scale, real_keys=kv_info[1]
+    )
+    if carry is not None:
+        out, lse = _merge_attention(out, lse, *carry)
+    return out.to(query.dtype), (out, lse)
+
+
 class TpuSplashAttentionBackend(SDPABackend):
     """TPU Pallas attention, tuned on v7x; uncovered shapes fall back to SDPA."""
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.TPU_SPLASH_ATTN
+
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
 
     @staticmethod
     def get_impl_cls() -> type["TpuSplashAttentionImpl"]:
@@ -593,7 +947,18 @@ class TpuSplashAttentionImpl(SDPAImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata,
-    ) -> torch.Tensor:
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if return_softmax_lse:
+            # [b, s, h, d] output and [b, h, s] natural-log LSE.
+            output, lse = tpu_attention_with_lse(
+                query.transpose(1, 2),
+                key.transpose(1, 2),
+                value.transpose(1, 2),
+                scale=self.softmax_scale,
+                is_causal=self.causal,
+            )
+            return output.transpose(1, 2), lse
         # Inputs are [b, s, h, d]. Ragged causal attention needs SDPAImpl's
         # bottom-right mask, which the kernels do not take.
         if (
@@ -611,6 +976,20 @@ class TpuSplashAttentionImpl(SDPAImpl):
             is_causal=self.causal,
         )
         return output.transpose(1, 2)
+
+    def forward_ring_resume(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_info: torch.Tensor,
+        carry: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if self.causal:
+            raise NotImplementedError("the all-gather ring is non-causal only")
+        return tpu_ring_attention_step(
+            query, key, value, kv_info, carry, scale=self.softmax_scale
+        )
 
     def forward_varlen(
         self,
