@@ -152,6 +152,11 @@ class TpuPlatform(Platform):
         return False
 
     @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        # safetensors rejects 'tpu:N'.
+        return False
+
+    @classmethod
     def inference_mode(cls):
         # torch_tpu's lazy tensors do not support torch.inference_mode.
         return torch.no_grad()
