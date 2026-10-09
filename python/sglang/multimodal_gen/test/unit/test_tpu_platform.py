@@ -178,6 +178,30 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_layerwise_offload_disabled(self):
         self.assertFalse(TpuPlatform.enable_dit_layerwise_offload_by_default())
 
+    def test_compile_warmup_keeps_the_dit_resident(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.base import (
+            PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        def server_args(**kwargs):
+            # ServerArgs.__post_init__ applies the platform defaults.
+            with (
+                patch.object(
+                    PipelineConfig, "from_kwargs", return_value=PipelineConfig()
+                ),
+                patch.object(
+                    current_platform,
+                    "apply_server_args_defaults",
+                    TpuPlatform().apply_server_args_defaults,
+                ),
+            ):
+                return ServerArgs.from_kwargs(model_path="/fake", **kwargs)
+
+        self.assertFalse(server_args().offload_during_compile)
+        self.assertTrue(server_args(offload_during_compile=True).offload_during_compile)
+
 
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")
 class TestWorkerInitOnce(unittest.TestCase):

@@ -39,6 +39,10 @@ def build_torch_compile_kwargs(
             and mode is not None
         ):
             compile_kwargs["mode"] = mode
+    elif current_platform.is_tpu():
+        # The torch_tpu backend compiles static shapes only.
+        compile_kwargs["backend"] = current_platform.get_compile_backend(mode)
+        compile_kwargs["dynamic"] = False
     elif current_platform.is_npu():
         from sglang.srt.utils.common import get_compiler_backend
 

@@ -518,6 +518,11 @@ class Platform:
         return CpuArchEnum.UNSPECIFIED
 
     @classmethod
+    def supports_vae_torch_compile(cls) -> bool:
+        """Whether ``--enable-torch-compile`` also compiles the VAE decode."""
+        return True
+
+    @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         """Whether automatic DiT layerwise offload is enabled on this platform."""
         return True

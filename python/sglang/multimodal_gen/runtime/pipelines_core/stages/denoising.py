@@ -562,6 +562,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         if current_platform.is_npu():
             logger.info("Compiling transformer with torchair backend on NPU")
+        elif current_platform.is_tpu():
+            logger.info("Compiling transformer with the torch_tpu backend")
         else:
             logger.info(f"Compiling transformer with mode: {mode}")
 

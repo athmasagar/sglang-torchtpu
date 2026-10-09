@@ -104,6 +104,26 @@ def test_out_of_tree_platform_controls_compile_kwargs(backend, options, expected
     get_compile_options.assert_called_once_with(module)
 
 
+def test_tpu_compiles_static_shapes_with_platform_backend():
+    compile_path = "sglang.multimodal_gen.runtime.utils.torch_compile"
+    with (
+        patch(f"{compile_path}.current_platform.is_out_of_tree", return_value=False),
+        patch(f"{compile_path}.current_platform.is_tpu", return_value=True),
+        patch(
+            f"{compile_path}.current_platform.get_compile_backend",
+            return_value="tpu",
+        ) as get_compile_backend,
+    ):
+        compile_kwargs = build_torch_compile_kwargs(
+            mode="max-autotune-no-cudagraphs",
+            module=_CompilableModule(),
+            enable_inductor_compute_comm_overlap=True,
+        )
+
+    assert compile_kwargs == {"backend": "tpu", "dynamic": False, "fullgraph": False}
+    get_compile_backend.assert_called_once_with("max-autotune-no-cudagraphs")
+
+
 def test_mova_uses_platform_compile_kwargs():
     stage = MOVADenoisingStage.__new__(MOVADenoisingStage)
     module = _CompilableModule()
@@ -180,6 +200,27 @@ def test_vae_compile_options_receive_the_target_module():
         default="default",
         module=vae,
     )
+
+
+def test_vae_decode_stays_eager_where_the_platform_cannot_compile_it():
+    stage = DecodingStage.__new__(DecodingStage)
+    decode = MagicMock()
+    compiled_callable = MagicMock(target_id=None, compiled_module=None)
+    module_path = "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding"
+
+    with patch(
+        f"{module_path}.current_platform.supports_vae_torch_compile",
+        return_value=False,
+    ):
+        result = stage._get_vae_decode_fn(
+            _CompilableModule(),
+            SimpleNamespace(enable_torch_compile=True),
+            decode_fn=decode,
+            compiled_callable=compiled_callable,
+        )
+
+    assert result is decode
+    compiled_callable.get_or_compile.assert_not_called()
 
 
 def test_ltx2_compile_conditions_match_only_direct_blocks():

@@ -191,6 +191,11 @@ class TpuPlatform(Platform):
         # tpu_dist needs one addressable PJRT device; a lone worker has many.
         return "gloo" if _world_size() == 1 else "tpu_dist"
 
+    def apply_server_args_defaults(self, server_args) -> None:
+        # The compile warmup layerwise-offloads the DiT, which TPU cannot run.
+        if not server_args.is_arg_explicitly_set("offload_during_compile"):
+            server_args.offload_during_compile = False
+
     @classmethod
     def get_attn_backend_cls_str(
         cls,
@@ -215,6 +220,13 @@ class TpuPlatform(Platform):
             "the supported backends are TORCH_SDPA (default) and "
             "TPU_SPLASH_ATTN."
         )
+
+    @classmethod
+    def supports_vae_torch_compile(cls) -> bool:
+        # Off for every VAE: the torch_tpu backend fails to compile the diffusers
+        # AutoencoderKL decoder (torch-tpu 0.1.1+release.2026.9.22), and the other
+        # VAEs are untested under it.
+        return False
 
     @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
