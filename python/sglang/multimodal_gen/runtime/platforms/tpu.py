@@ -45,6 +45,28 @@ def _memory_stat(key: str) -> int:
     return int(torch.accelerator.memory_stats().get(key, 0))
 
 
+def _add_compiler_flags_to_compile_cache_key() -> None:
+    import hashlib
+
+    import torch.compiler.config as compiler_config
+
+    flags = "\0".join(
+        os.environ.get(name, "")
+        for name in (
+            "LIBTPU_INIT_ARGS",
+            "XLA_FLAGS",
+            "TORCH_TPU_INTERNAL_XLA_OPTIONS",
+            # Read at compile time: where torch_tpu splits graphs at collectives.
+            "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+        )
+    )
+    tag = f"tpu-compiler-flags-v1:{hashlib.sha256(flags.encode()).hexdigest()[:16]}"
+    # '|'-joined and idempotent, like srt's compile_cache tags.
+    existing_tag = str(compiler_config.cache_key_tag or "")
+    if tag not in existing_tag.split("|"):
+        compiler_config.cache_key_tag = f"{existing_tag}|{tag}" if existing_tag else tag
+
+
 def _install_device_module_shims() -> None:
     for name, fn in _DEVICE_MODULE_SHIMS.items():
         if not hasattr(torch.tpu, name):
@@ -186,6 +208,19 @@ class TpuPlatform(Platform):
 
         _install_device_module_shims()
         torch.zeros(1, device="tpu")
+
+    def configure_compile_cache(self) -> None:
+        # torch_tpu persists XLA executables in AOTAutogradCache, whose key sees
+        # neither the device assignment behind collectives, opaque Pallas kernel
+        # sources nor the XLA flags: a stale hit can hang or ignore new flags.
+        from sglang_tpu.compile_cache import (
+            add_tpu_kernel_inputs_to_compile_cache_key,
+            add_tpu_rank_assignment_to_compile_cache_key,
+        )
+
+        add_tpu_rank_assignment_to_compile_cache_key()
+        add_tpu_kernel_inputs_to_compile_cache_key()
+        _add_compiler_flags_to_compile_cache_key()
 
     def get_torch_distributed_backend_str(self) -> str:
         # tpu_dist needs one addressable PJRT device; a lone worker has many.
