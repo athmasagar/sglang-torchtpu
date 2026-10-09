@@ -604,6 +604,27 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     s_local, h_global = s_global // world_size, h_local * world_size
 
+    if head_dim == 2 and h_local > 1 and x.transpose(1, 2).is_contiguous():
+        # Heads-major input ([b, h_local, s, d] viewed as [b, s, h_local, d]), on
+        # every platform: exchange whole [s_local, d] head slabs and relayout
+        # once after the exchange, merged with the head gather, instead of
+        # relayouting to sequence-major before it. Values are bit-identical to
+        # the path below. On TPU the slab rows stay dense, so (8, 128) tiles do
+        # not pad h_local. h_local > 1: with one head, sequence-major inputs
+        # also pass the contiguity check.
+        x = (
+            x.transpose(1, 2)
+            .reshape(b, h_local, world_size, s_local, d)
+            .permute(2, 0, 1, 3, 4)
+            .contiguous()
+        )
+        x = _usp_all_to_all_single(x, role="usp_output")
+        # [world_size, b, h_local, s_local, d] -> [b, s_local, h_global, d]. A
+        # fresh tensor: contiguous() is a no-op when b == s_local == 1 and would
+        # return a view of the reused staging buffer.
+        x = x.permute(1, 3, 0, 2, 4).clone(memory_format=torch.contiguous_format)
+        return x.view(b, s_local, h_global, d)
+
     x = x.permute(permute_order).contiguous()
     x = _usp_all_to_all_single(x, role="usp_output")
     x = x.reshape(world_size, s_local, b, h_local, d)

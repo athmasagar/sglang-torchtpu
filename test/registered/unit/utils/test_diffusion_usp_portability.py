@@ -80,6 +80,7 @@ def _gloo_worker(rank, world, init_method):
                 torch.testing.assert_close(exchanged, reference, rtol=0, atol=0)
                 restored = usp._usp_output_all_to_all(exchanged, head_dim=head_dim)
                 torch.testing.assert_close(restored, shard, rtol=0, atol=0)
+                assert restored.is_contiguous()
             qkv = usp._usp_input_all_to_all_qkv(local, local + 10, local + 20)
             for index, actual in enumerate(qkv):
                 torch.testing.assert_close(
@@ -93,8 +94,63 @@ def _gloo_worker(rank, world, init_method):
                     torch.testing.assert_close(
                         actual, expected[0] + 10 * index, rtol=0, atol=0
                     )
+        _check_head_dim2_output_exchange(usp, rank, world)
     finally:
         dist.destroy_process_group()
+
+
+def _check_head_dim2_output_exchange(usp, rank, world):
+    """Heads-major output (an attention kernel's [b, h, s, d] result viewed as
+    [b, s, h, d], more than one local head) is exchanged in head slabs on every
+    platform; any other layout takes the sequence-major relayout. Both return
+    bit-identical values in a fresh contiguous tensor."""
+    exchange = usp._usp_all_to_all_single
+    exchanged_ndims = []
+
+    def recording_exchange(x, role=None):
+        exchanged_ndims.append(x.ndim)
+        return exchange(x, role=role)
+
+    staging = {}
+
+    def reused_staging_buffer(role, shape, dtype, device):
+        # CUDA's per-role buffer: the next exchange overwrites any alias of it.
+        numel = math.prod(shape)
+        if role not in staging or staging[role].numel() < numel:
+            staging[role] = torch.empty(numel, dtype=dtype, device=device)
+        return staging[role][:numel].view(shape)
+
+    usp._usp_all_to_all_single = recording_exchange
+    usp._a2a_staging_buffer = reused_staging_buffer
+    prefix, local_seq, dim = 2, 3, 5
+    for batch in (1, 2):
+        for local_heads in (1, 2):
+            shape = (batch, prefix + local_seq * world, local_heads * world, dim)
+            full = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape)
+            start = prefix + rank * local_seq
+            local = full[:, start : start + local_seq]
+            heads = full[:, :, rank * local_heads : (rank + 1) * local_heads]
+            heads_major = heads.transpose(1, 2).contiguous().transpose(1, 2)
+            cases = {
+                "sequence-major": (heads[:, prefix:].contiguous(), False),
+                "heads-major": (
+                    heads[:, prefix:].transpose(1, 2).contiguous().transpose(1, 2),
+                    local_heads > 1,
+                ),
+                # A replicated prefix sliced off a heads-major result, as in
+                # USPAttention._forward_with_replicated_prefix.
+                "prefix-sliced heads-major": (heads_major[:, prefix:], False),
+            }
+            for name, (x, head_slabs) in cases.items():
+                case = f"{name}, batch={batch}, local_heads={local_heads}"
+                exchanged_ndims.clear()
+                out = usp._usp_output_all_to_all(x, head_dim=2)
+                assert exchanged_ndims == [5 if head_slabs else 4], case
+                torch.testing.assert_close(out, local, rtol=0, atol=0, msg=case)
+                assert out.is_contiguous(), case
+                kept = out.clone()
+                usp._usp_output_all_to_all(x + 1, head_dim=2)
+                torch.testing.assert_close(out, kept, rtol=0, atol=0, msg=case)
 
 
 class TestUspPortableLayouts(unittest.TestCase):
