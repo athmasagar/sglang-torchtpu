@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Microbenchmark + numerics check for the TPU Pallas splash attention ops.
 
-Times, at one ``[B, H, S, D]`` shape (non-causal, q_seq == kv_seq):
+Times, at one non-causal ``[B, H, S, D]`` shape:
 
 * the flash kernel op (autotuned blocks), which ``tpu_attention`` selects for
   long KV;
@@ -71,7 +71,10 @@ def _time(fn, args, warmup, iters, label, flops, keep_output):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seq", type=int, default=75600, help="q and kv sequence length")
+    ap.add_argument("--seq", type=int, default=75600, help="query sequence length")
+    ap.add_argument(
+        "--kv-seq", type=int, default=None, help="key/value length (default: --seq)"
+    )
     ap.add_argument(
         "--heads", type=int, default=10, help="local heads after the Ulysses all-to-all"
     )
@@ -93,20 +96,24 @@ def main():
     )
 
     head_dim = 128
+    kv_seq = args.kv_seq or args.seq
     print(
-        f"shape: B=1 H={args.heads} S={args.seq} D={head_dim} bf16\n"
-        f"flash kernel blocks: {tsa.autotune_block_sizes(args.seq, args.seq, head_dim)}"
+        f"shape: B=1 H={args.heads} Sq={args.seq} Skv={kv_seq} D={head_dim} bf16\n"
+        f"flash kernel blocks: {tsa.autotune_block_sizes(args.seq, kv_seq, head_dim)}"
     )
     tsa._register_ops()
 
     torch.manual_seed(0)
-    shape = (1, args.heads, args.seq, head_dim)
-    q_cpu, k_cpu, v_cpu = (torch.randn(shape, dtype=torch.bfloat16) for _ in range(3))
+    q_cpu = torch.randn(1, args.heads, args.seq, head_dim, dtype=torch.bfloat16)
+    k_cpu, v_cpu = (
+        torch.randn(1, args.heads, kv_seq, head_dim, dtype=torch.bfloat16)
+        for _ in range(2)
+    )
     scale = head_dim**-0.5
     q, k, v = (t.to("tpu") for t in (q_cpu, k_cpu, v_cpu))
     _sync([q, k, v])
     # QK^T + PV.
-    flops = 4 * args.seq * args.seq * head_dim * args.heads
+    flops = 4 * args.seq * kv_seq * head_dim * args.heads
 
     results = {}
     for name, label, fn in (
