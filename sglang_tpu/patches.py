@@ -344,6 +344,14 @@ def _register_aten_fallbacks() -> None:
         self.copy_(out)
         return self
 
+    # aten::logaddexp -- no TPU kernel; the ring-attention LSE merges use it.
+    @torch.library.register_kernel("aten::logaddexp", "PrivateUse1")
+    def _logaddexp(self, other):
+        peak = torch.maximum(self, other)
+        # Both -inf: keep the result -inf instead of NaN from inf - inf.
+        peak = torch.where(torch.isinf(peak), torch.zeros_like(peak), peak)
+        return peak + torch.log(torch.exp(self - peak) + torch.exp(other - peak))
+
     # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
     # back. Vision towers use it to resize position embeddings per image grid
     # (MoonViT's Learnable2DInterpPosEmb in Kimi-VL), so inputs are small (tens
@@ -360,7 +368,7 @@ def _register_aten_fallbacks() -> None:
 
     logger.info(
         "Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, "
-        "masked_scatter_, upsample_bicubic2d"
+        "masked_scatter_, logaddexp, upsample_bicubic2d"
     )
 
 

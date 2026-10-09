@@ -344,11 +344,12 @@ class TestTorchTpuIntegration(unittest.TestCase):
         self.assertFalse(torch.tpu.is_initialized())
 
     def test_srt_symbols_the_platform_imports_exist(self):
-        # The plugin's worker hooks import this lazily; a rename on the srt
+        # The plugin's worker hooks import these lazily; a rename on the srt
         # side must fail here, not at worker bootstrap.
-        from sglang_tpu.patches import _prepare_tpu_env
+        from sglang_tpu.patches import _prepare_tpu_env, _register_aten_fallbacks
 
         self.assertTrue(callable(_prepare_tpu_env))
+        self.assertTrue(callable(_register_aten_fallbacks))
 
     def test_importing_the_platform_package_does_not_initialize_pjrt(self):
         # The parent resolves current_platform before spawning the worker;

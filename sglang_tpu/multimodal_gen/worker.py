@@ -15,10 +15,15 @@ def prepare_env(world_size: int) -> None:
 
 def install_runtime_patches() -> None:
     """Patch ``torch_tpu`` for a worker; call after it is imported."""
-    from sglang_tpu.patches import _patch_set_device_tolerate_mismatch
+    from sglang_tpu.patches import (
+        _patch_set_device_tolerate_mismatch,
+        _register_aten_fallbacks,
+    )
 
     # PJRT owns the chiplet binding; local_rank is only a label.
     _patch_set_device_tolerate_mismatch()
+    # sglang_tpu's kernels for ATen ops torch_tpu lacks (e.g. logaddexp).
+    _register_aten_fallbacks()
 
 
 def configure_compile_cache() -> None:
