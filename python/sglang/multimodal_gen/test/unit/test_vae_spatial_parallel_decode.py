@@ -497,6 +497,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         with (
             _collectives_only_decode_group(world_size) as group,
             patch.object(wanvae.dist, "is_initialized", return_value=True),
+            patch.object(wanvae, "get_sp_world_size", lambda: world_size),
             patch.object(wanvae, "get_decode_parallel_world_size", lambda: world_size),
             patch.object(
                 wanvae, "get_decode_parallel_rank", lambda: _thread_rank.value
@@ -515,6 +516,37 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
 
         for output in outputs:
             torch.testing.assert_close(output, expected)
+
+    def test_wan_encoder_shards_only_under_sequence_parallelism(self):
+        def build(sp_world_size, decode_world_size):
+            _thread_rank.value = 0
+            with (
+                _collectives_only_decode_group(decode_world_size),
+                patch.object(wanvae.dist, "is_initialized", return_value=True),
+                patch.object(wanvae, "get_sp_world_size", lambda: sp_world_size),
+                patch.object(
+                    wanvae, "get_decode_parallel_world_size", lambda: decode_world_size
+                ),
+                patch.object(wanvae, "get_decode_parallel_rank", lambda: 0),
+            ):
+                return WanEncoder3d(
+                    dim=8,
+                    z_dim=4,
+                    dim_mult=(1, 2, 2),
+                    num_res_blocks=1,
+                    temperal_downsample=(True, False),
+                    use_parallel_encode=True,
+                )
+
+        # CFG-parallel only (decode group 2, one SP rank): every rank encodes
+        # the whole input, as before.
+        encoder = build(sp_world_size=1, decode_world_size=2)
+        self.assertEqual(encoder.world_size, 1)
+        self.assertNotIsInstance(encoder.conv_in, SpatialParallelCausalConv3d)
+        # SP 2 x CFG 2: the input splits over the 4-rank decode group.
+        encoder = build(sp_world_size=2, decode_world_size=4)
+        self.assertEqual(encoder.world_size, 4)
+        self.assertIsInstance(encoder.conv_in, SpatialParallelCausalConv3d)
 
     def test_wan_encode_split_keeps_whole_downsampling_blocks(self):
         x = torch.arange(40).view(1, 1, 1, 40, 1)

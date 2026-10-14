@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
+    get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
@@ -975,10 +976,12 @@ class WanEncoder3d(nn.Module):
         dims = [dim * u for u in [1] + dim_mult]
         scale = 1.0
 
-        # The sharded convs and height gathers run over the decode group, so
-        # the input must be split over the same ranks.
+        # Encode shards only under sequence parallelism, as before: with one SP
+        # rank (CFG-, TP- or PP-only launches) every rank encodes the whole
+        # input. When it shards, the input splits over the decode group, the
+        # ranks the sharded convs and height gathers run over.
         world_size = 1
-        if dist.is_initialized():
+        if dist.is_initialized() and get_sp_world_size() > 1:
             world_size = get_decode_parallel_world_size()
 
         if use_parallel_encode and world_size > 1:
@@ -1039,8 +1042,8 @@ class WanEncoder3d(nn.Module):
         self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
-        if dist.is_initialized():
-            self.world_size = get_decode_parallel_world_size()
+        if world_size > 1:
+            self.world_size = world_size
             self.rank = get_decode_parallel_rank()
 
     def forward(self, x):
