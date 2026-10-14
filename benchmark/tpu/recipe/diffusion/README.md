@@ -16,20 +16,6 @@ Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`)
 and scoped-VMEM defaults are added unless it sets them. Extra arguments are passed to the server, e.g.
 `./ltx2.sh --warmup-resolutions 1280x720`.
 
-## Performance
-
-tpu7x 2x2x1, steady-state request (the first request compiles), seed 42. E2E and peak HBM come from a default run;
-denoise step and VAE decode from a run with `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`, which synchronizes the device at
-stage boundaries (otherwise queued denoising work is counted in the decode stage).
-
-| Model | Request | Cores | E2E | Denoise step | VAE decode | Peak HBM / core |
-| :--- | :--- | :---: | ---: | ---: | ---: | ---: |
-| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 1 | 0.90 s | 0.076 s | 0.33 s | 24.8 GB |
-| FLUX.2-klein-4B | T2I 1024x1024, 4 steps | 4 | 0.85 s | 0.044 s | 0.33 s | 19.2 GB |
-| Z-Image-Turbo | T2I 1024x1024, 9 steps | 1 | 1.36 s | 0.088 s | 0.33 s | 29.2 GB |
-| Z-Image-Turbo | T2I 1024x1024, 9 steps | 2 | 1.31 s | 0.069 s | 0.33 s | 25.2 GB |
-| LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 23.2 s | 0.433 s | 2.3 s | 60.6 GB |
-
 ## Example requests
 
 `/v1/images/generations` returns the image; `size`, `num_inference_steps` and `guidance_scale` set the request.

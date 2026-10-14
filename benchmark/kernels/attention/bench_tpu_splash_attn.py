@@ -4,7 +4,7 @@
 Times, at one non-causal ``[B, H, S, D]`` shape:
 
 * the flash kernel op (autotuned blocks), which ``tpu_attention`` selects for
-  long KV;
+  non-causal attention over at least 512 keys;
 * the ``make_splash_mha`` op at the same shape (query and KV padded to its
   blocks, padded keys masked);
 * torch SDPA (the ``torch_sdpa`` backend).
@@ -91,9 +91,7 @@ def main():
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
     import torch_tpu  # noqa: F401  (registers the 'tpu' PrivateUse1 device)
 
-    from sglang.multimodal_gen.runtime.layers.attention.backends import (
-        tpu_splash_attn as tsa,
-    )
+    from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
 
     head_dim = 128
     kv_seq = args.kv_seq or args.seq
