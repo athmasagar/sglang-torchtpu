@@ -6,7 +6,9 @@ short sequence-parallel query shard), stock ``make_splash_mha`` for short
 aligned cross-attention and medium or causal shapes (including zero-padded
 KV, whose padded keys must not take softmax weight), and the SDPA fallback.
 
-The numeric tests need TPU + torch_tpu and are skipped otherwise.
+The numeric tests need the Pallas kernels (TPU v7x, torch_tpu, jax) and are
+skipped otherwise; each asserts which path ran, so a lane without the kernels
+cannot pass by comparing SDPA with SDPA.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -46,6 +48,10 @@ def _reference(q, k, v, scale, is_causal):
     return out
 
 
+def _rel_l2(got, want):
+    return ((got.float() - want).norm() / want.norm()).item()
+
+
 def _inputs(batch, heads, q_seq, kv_seq, *, q_gain=1.0, negative_scores=False):
     gen = torch.Generator().manual_seed(q_seq * 7919 + kv_seq)
     shape_q = (batch, heads, q_seq, 128)
@@ -54,99 +60,137 @@ def _inputs(batch, heads, q_seq, kv_seq, *, q_gain=1.0, negative_scores=False):
     k = torch.randn(shape_kv, generator=gen)
     v = torch.randn(shape_kv, generator=gen)
     if negative_scores:
-        # Every real logit is strongly negative, so a zero-padded key (logit 0)
-        # would dominate the softmax if it were not masked.
+        # Every real logit is strongly negative (mean -64 / sqrt(128) = -5.7),
+        # so a zero-padded key (logit 0) would dominate the softmax if it were
+        # not masked.
         direction = torch.ones(128) / 128**0.5
-        q = q * 0.1 + 4.0 * direction
-        k = k * 0.1 - 4.0 * direction
+        q = q * 0.1 + 8.0 * direction
+        k = k * 0.1 - 8.0 * direction
     return q.bfloat16(), k.bfloat16(), v.bfloat16()
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuSplashAttentionNumerics(CustomTestCase):
-    def _check(self, batch, heads, q_seq, kv_seq, *, is_causal=False, **kwargs):
-        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
-            tpu_attention,
-        )
+    def _check(
+        self,
+        batch,
+        heads,
+        q_seq,
+        kv_seq,
+        *,
+        expect,
+        is_causal=False,
+        scale=128**-0.5,
+        **kwargs,
+    ):
+        """``expect`` is the path that must run: "flash", "splash" or "sdpa"."""
+        from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
 
+        if not tsa._check_splash_available():
+            self.skipTest("Pallas kernels unavailable (needs TPU v7x and jax)")
+        tsa._register_ops()
         q, k, v = _inputs(batch, heads, q_seq, kv_seq, **kwargs)
-        scale = 128**-0.5
         want = _reference(q, k, v, scale, is_causal)
         q, k, v = q.to("tpu"), k.to("tpu"), v.to("tpu")
-        got = tpu_attention(q, k, v, scale=scale, is_causal=is_causal).to("cpu")
+        with (
+            patch.object(tsa, "_FLASH_OP", wraps=tsa._FLASH_OP) as flash,
+            patch.object(tsa, "_SPLASH_MHA_OP", wraps=tsa._SPLASH_MHA_OP) as splash,
+        ):
+            got = tsa.tpu_attention(q, k, v, scale=scale, is_causal=is_causal)
+        got = got.to("cpu")
+        ran = {"flash": (1, 0), "splash": (0, 1), "sdpa": (0, 0)}[expect]
+        self.assertEqual((flash.call_count, splash.call_count), ran, expect)
         sdpa = F.scaled_dot_product_attention(
             q, k, v, scale=scale, is_causal=is_causal
         ).to("cpu")
         self.assertEqual(got.shape, want.shape)
         self.assertEqual(got.dtype, torch.bfloat16)
         self.assertFalse(torch.isnan(got).any().item())
+        rel, sdpa_rel = _rel_l2(got, want), _rel_l2(sdpa, want)
         err = (got.float() - want).abs().max().item()
         sdpa_err = (sdpa.float() - want).abs().max().item()
-        # bf16 inputs bound the achievable accuracy; peaked softmaxes amplify
-        # it, so allow up to twice the error of bf16 SDPA on the same inputs.
-        tol = max(2e-2, 2 * sdpa_err)
-        print(f"{self._testMethodName}: max abs err {err:.3e} (sdpa {sdpa_err:.3e})")
-        self.assertLess(err, tol, f"max abs error {err:.3e}, sdpa {sdpa_err:.3e}")
+        print(
+            f"{self._testMethodName}: rel-L2 {rel:.3e} (sdpa {sdpa_rel:.3e}), "
+            f"max abs {err:.3e} (sdpa {sdpa_err:.3e})"
+        )
+        # Relative L2 over the whole output: a padded key taking softmax weight
+        # stays under a max-abs bound but moves rel-L2 by ~1e-1. bf16 inputs
+        # bound the achievable accuracy, so allow twice bf16 SDPA's error.
+        self.assertLess(rel, max(1e-2, 2 * sdpa_rel), "rel-L2")
+        self.assertLess(err, max(2e-2, 2 * sdpa_err), "max abs")
 
     # Custom kernel: kv_seq >= 2048.
-    def test_custom_aligned(self):
-        self._check(1, 4, 4608, 4608)
+    def test_custom_two_blocks_and_a_ragged_tail(self):
+        # 4608 = 2 * 2048 + 512.
+        self._check(1, 4, 4608, 4608, expect="flash")
+
+    def test_custom_whole_kv_blocks(self):
+        # 4096 = 2 * 2048: no partial last block.
+        self._check(1, 2, 4096, 4096, expect="flash")
+
+    def test_custom_single_kv_block(self):
+        # One KV block: the first, last and only grid step coincide.
+        self._check(1, 2, 2048, 2048, expect="flash")
+
+    def test_custom_softmax_scale(self):
+        # A scale other than head_dim ** -0.5, which equals the default.
+        self._check(1, 2, 4128, 4128, expect="flash", scale=0.05)
 
     def test_custom_ragged_kv_tail(self):
         # 4128 = 2 * 2048 + 32: the last KV block is a 32-row partial block.
-        self._check(1, 2, 4128, 4128)
+        self._check(1, 2, 4128, 4128, expect="flash")
 
     def test_custom_odd_kv_tail(self):
         # 8191 = 3 * 2048 + 2047: an odd-length partial last block.
-        self._check(1, 2, 8191, 8191)
+        self._check(1, 2, 8191, 8191, expect="flash")
 
     def test_custom_short_query_shard(self):
         # A sequence-parallel query shard attending the gathered KV.
-        self._check(1, 2, 880, 3520)
+        self._check(1, 2, 880, 3520, expect="flash")
 
     def test_custom_batched(self):
         # B=2, as with batched CFG.
-        self._check(2, 2, 8190, 8190)
+        self._check(2, 2, 8190, 8190, expect="flash")
 
     def test_custom_high_logit_gain(self):
         # Large logits make the softmax peaked and amplify rounding.
-        self._check(1, 2, 8190, 8190, q_gain=8.0)
+        self._check(1, 2, 8190, 8190, expect="flash", q_gain=8.0)
 
     def test_custom_negative_scores(self):
-        self._check(1, 2, 4128, 4128, negative_scores=True)
+        self._check(1, 2, 4128, 4128, expect="flash", negative_scores=True)
 
     # make_splash_mha, long query against short aligned KV.
     def test_cross_attention_aligned_kv(self):
-        self._check(1, 4, 4096, 512)
+        self._check(1, 4, 4096, 512, expect="splash")
 
     def test_cross_attention_kv_not_multiple_of_1024(self):
-        self._check(1, 2, 4096, 1536, negative_scores=True)
+        self._check(1, 2, 4096, 1536, expect="splash", negative_scores=True)
 
     # make_splash_mha, medium and causal shapes.
     def test_medium_padded_kv_is_masked(self):
         # 1000 pads to 1024: 24 zero keys that must stay masked.
-        self._check(1, 4, 1000, 1000, negative_scores=True)
+        self._check(1, 4, 1000, 1000, expect="splash", negative_scores=True)
 
     def test_medium_aligned(self):
-        self._check(1, 2, 1024, 1024)
+        self._check(1, 2, 1024, 1024, expect="splash")
 
     def test_short_query_long_padded_kv(self):
         # q_seq < 256 with kv >= 2048: make_splash_mha with segment-id masking.
-        self._check(1, 2, 200, 4128, negative_scores=True)
+        self._check(1, 2, 200, 4128, expect="splash", negative_scores=True)
 
     def test_long_query_unaligned_kv(self):
         # 1024 < kv < 2048, not 128-aligned: KV padded to 1536, masked.
-        self._check(1, 2, 4096, 1500, negative_scores=True)
+        self._check(1, 2, 4096, 1500, expect="splash", negative_scores=True)
 
     def test_causal_padded(self):
-        self._check(1, 2, 1000, 1000, is_causal=True)
+        self._check(1, 2, 1000, 1000, expect="splash", is_causal=True)
 
     # Short or unaligned-short KV stays on SDPA.
     def test_short_sequences(self):
-        self._check(1, 4, 300, 77)
+        self._check(1, 4, 300, 77, expect="sdpa")
 
     def test_unaligned_short_kv(self):
-        self._check(1, 2, 4096, 1000)
+        self._check(1, 2, 4096, 1000, expect="sdpa")
 
     def test_gqa(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
