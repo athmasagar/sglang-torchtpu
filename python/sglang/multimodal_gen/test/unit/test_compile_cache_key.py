@@ -92,7 +92,7 @@ class TestTpuCompileCacheKey(unittest.TestCase):
         user, pallas_sources, flags = self._tags()
         self.assertEqual(user, "user-tag")
         self.assertRegex(pallas_sources, r"^tpu-kernel-inputs-v1:[0-9a-f]{64}$")
-        self.assertRegex(flags, r"^tpu-compiler-flags-v1:[0-9a-f]{16}$")
+        self.assertRegex(flags, r"^tpu-compiler-v2:[0-9a-f]{16}$")
 
     def test_key_covers_the_rank_assignment_of_a_multi_worker_launch(self):
         self.assertFalse(
@@ -112,6 +112,29 @@ class TestTpuCompileCacheKey(unittest.TestCase):
                 self.assertNotEqual(self._tags(**{name: "--x=1"})[-1], flags_tag)
         tagged = "|".join(self._tags())
         self.assertEqual(self._tags(existing=tagged).count(flags_tag), 1)
+
+    def test_flags_tag_tracks_compiler_versions_chip_and_topology(self):
+        from importlib import metadata
+
+        flags_tag = self._tags()[-1]
+        real_version = metadata.version
+        for dist in ("torch_tpu", "libtpu", "jax", "jaxlib"):
+            with self.subTest(dist=dist):
+
+                def bumped(name, dist=dist):
+                    if name == dist:
+                        return "999.0"
+                    try:
+                        return real_version(name)
+                    except metadata.PackageNotFoundError:
+                        return ""
+
+                with patch("importlib.metadata.version", side_effect=bumped):
+                    self.assertNotEqual(self._tags()[-1], flags_tag)
+        with patch.object(TpuPlatform, "get_device_name", return_value="TPU v0"):
+            self.assertNotEqual(self._tags()[-1], flags_tag)
+        with patch.dict(os.environ, {"TORCH_TPU_TOPOLOGY": "4x4x4"}):
+            self.assertNotEqual(self._tags()[-1], flags_tag)
 
 
 if __name__ == "__main__":

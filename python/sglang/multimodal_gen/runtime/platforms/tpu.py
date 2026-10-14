@@ -47,10 +47,17 @@ def _memory_stat(key: str) -> int:
 
 def _add_compiler_flags_to_compile_cache_key() -> None:
     import hashlib
+    from importlib import metadata
 
     import torch.compiler.config as compiler_config
 
-    flags = "\0".join(
+    def version(dist: str) -> str:
+        try:
+            return metadata.version(dist)
+        except metadata.PackageNotFoundError:
+            return ""
+
+    flags = [
         os.environ.get(name, "")
         for name in (
             "LIBTPU_INIT_ARGS",
@@ -59,8 +66,14 @@ def _add_compiler_flags_to_compile_cache_key() -> None:
             # Read at compile time: where torch_tpu splits graphs at collectives.
             "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         )
-    )
-    tag = f"tpu-compiler-flags-v1:{hashlib.sha256(flags.encode()).hexdigest()[:16]}"
+    ]
+    # A persisted executable is stale across compiler releases and chip kinds,
+    # and the rank-assignment tag (multi-worker launches only) leaves the slice
+    # shape of a single-worker launch out.
+    flags += [version(dist) for dist in ("torch_tpu", "libtpu", "jax", "jaxlib")]
+    flags += [TpuPlatform.get_device_name(), os.environ.get("TORCH_TPU_TOPOLOGY", "")]
+    digest = hashlib.sha256("\0".join(flags).encode()).hexdigest()[:16]
+    tag = f"tpu-compiler-v2:{digest}"
     # '|'-joined and idempotent, like srt's compile_cache tags.
     existing_tag = str(compiler_config.cache_key_tag or "")
     if tag not in existing_tag.split("|"):
