@@ -115,12 +115,14 @@ def _score_tile_bytes(
     head_dim: int = 128,
     block_kv: int = 2048,
     bytes_per_element: int = 2,
+    carry_bytes_per_q_row: int = 0,
 ) -> int:
     score_f32 = block_kv_compute * block_q * 4
     qkv_2x = 2 * (block_q + 2 * block_kv) * head_dim * bytes_per_element
     output_f32 = block_q * head_dim * 4
     max_sum_scratch = 2 * 8 * block_q * 4
-    return score_f32 + qkv_2x + output_f32 + max_sum_scratch
+    carry = carry_bytes_per_q_row * block_q
+    return score_f32 + qkv_2x + output_f32 + max_sum_scratch + carry
 
 
 def _autotune_block_sizes(
@@ -128,11 +130,14 @@ def _autotune_block_sizes(
     kv_seq: int,
     head_dim: int = 128,
     vmem_capacity_bytes: int = _V7X_VMEM_CAPACITY_BYTES,
+    carry_bytes_per_q_row: int = 0,
 ) -> tuple[int, int, int]:
     """``(block_q, block_kv, block_kv_compute)`` of the flash kernel on TPU v7x.
 
     Minimizes grid-cell cost under a VMEM budget, keeping at least two query
     blocks per head. The VMEM model holds on v7x only.
+    ``carry_bytes_per_q_row`` is VMEM per query row beyond the score tile,
+    e.g. a ring step's float32 carry blocks.
     """
     mxu_dim = 256
     safe_kv_block = 2048
@@ -153,7 +158,10 @@ def _autotune_block_sizes(
     vmem_max = mxu_dim
     bq = mxu_dim
     while bq <= min(q_seq, max_block_q):
-        if _score_tile_bytes(bq, block_kv_compute, head_dim, block_kv) <= vmem_budget:
+        tile_bytes = _score_tile_bytes(
+            bq, block_kv_compute, head_dim, block_kv, 2, carry_bytes_per_q_row
+        )
+        if tile_bytes <= vmem_budget:
             vmem_max = bq
             bq += mxu_dim
         else:
@@ -240,10 +248,15 @@ def _flash_call(
     from jax.experimental.pallas import tpu as pltpu
 
     q_heads_per_kv_head = heads // kv_heads
+    carry_bytes_per_q_row = 0
+    if runtime_kv:
+        # A ring step writes its float32 output and log-sum-exp and, resuming,
+        # reads the previous ones: double-buffered blocks per query row.
+        carry_bytes_per_q_row = (1 + resume) * 2 * (head_dim + NUM_SUBLANES) * 4
     # One VMEM figure feeds both the block-size model and Mosaic's limit.
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     block_q, block_kv, block_kv_compute = _autotune_block_sizes(
-        q_seq, kv_seq, head_dim, vmem_capacity_bytes
+        q_seq, kv_seq, head_dim, vmem_capacity_bytes, carry_bytes_per_q_row
     )
     grid_width = pl.cdiv(kv_seq, block_kv)
     qk_scale = scale * LOG2_E
@@ -479,8 +492,12 @@ def _flash_attention_ring(q, k, v, kv_info, out_prev, lse_prev, scale):
     rows ``offset .. offset + B * H_kv`` of the batch-flattened stack (``None``:
     ``k``/``v`` are ``[B, H_kv, S_kv, D]`` and every key counts). With
     ``out_prev``/``lse_prev`` the softmax resumes from earlier shards. Returns
-    the output and base-2 log-sum-exp ``[B, H, NUM_SUBLANES, S]`` float32.
+    the output, float32 for a ring step (``kv_info`` given) so the carry is
+    not rounded between steps and ``q``'s dtype otherwise, and the base-2
+    log-sum-exp ``[B, H, NUM_SUBLANES, S]`` float32.
     """
+    import jax.numpy as jnp
+
     batch, heads, q_seq, head_dim = q.shape
     resume = out_prev is not None
     runtime_kv = kv_info is not None
@@ -492,7 +509,7 @@ def _flash_attention_ring(q, k, v, kv_info, out_prev, lse_prev, scale):
         num_rows=batch * heads,
         heads=heads,
         kv_heads=k.shape[1],
-        out_dtype=q.dtype,
+        out_dtype=jnp.float32 if runtime_kv else q.dtype,
         return_lse=True,
         resume=resume,
         runtime_kv=runtime_kv,
@@ -619,8 +636,11 @@ def _register_ops() -> None:
             def flash_ring_fake(q, k, v, kv_info, out_prev, lse_prev, scale):
                 batch, heads, q_seq = q.shape[:3]
                 lse_shape = (batch, heads, NUM_SUBLANES, q_seq)
-                return q.new_empty(q.shape), q.new_empty(
-                    lse_shape, dtype=torch.float32
+                # A ring step (kv_info given) returns its float32 carry.
+                out_dtype = torch.float32 if kv_info is not None else q.dtype
+                return (
+                    q.new_empty(q.shape, dtype=out_dtype),
+                    q.new_empty(lse_shape, dtype=torch.float32),
                 )
 
             def splash_mha_fake(q, k, v, scale, is_causal):
@@ -850,9 +870,10 @@ def tpu_ring_attention_step(
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """One all-gather ring step; see ``AttentionImpl.forward_ring_resume``.
 
-    The kernel carries the bf16 output and base-2 log-sum-exp between steps
-    (one bf16 rounding of the partial output per step); shapes the kernel
-    does not take carry float32 output and natural-log LSE.
+    Steps carry the float32 partial output and its log-sum-exp (base 2 from
+    the kernel; natural log from the reference, which serves the shapes the
+    kernel does not take), so only the returned output is rounded to the
+    query dtype.
     """
     if _ring_kernel_fallback_reason(query, key, value) is None:
         _register_ops()
@@ -866,7 +887,7 @@ def tpu_ring_attention_step(
             lse_prev,
             scale,
         )
-        return out, (out, lse2)
+        return out.to(query.dtype), (out, lse2)
     # Same shard selection as the kernel's index map, as device data.
     batch, kv_heads = query.shape[0], key.shape[1]
     rows = kv_info[0] + torch.arange(batch * kv_heads, device=key.device)
