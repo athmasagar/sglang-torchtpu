@@ -1,10 +1,11 @@
 """Numerics of the multimodal_gen TPU splash attention backend.
 
 Every dispatch branch of ``tpu_attention`` is checked against a float32
-reference: the custom Pallas kernel (long KV, including ragged KV tails and a
-short sequence-parallel query shard), stock ``make_splash_mha`` for short
-aligned cross-attention and medium or causal shapes (including zero-padded
-KV, whose padded keys must not take softmax weight), and the SDPA fallback.
+reference: the custom Pallas kernel (non-causal attention over at least 512
+keys, including ragged KV tails, text cross-attention and a short
+sequence-parallel query shard), stock ``make_splash_mha`` for causal shapes,
+short query shards and fewer than 512 aligned keys (including zero-padded KV,
+whose padded keys must not take softmax weight), and the SDPA fallback.
 
 The numeric tests need the Pallas kernels (TPU v7x, torch_tpu, jax) and are
 skipped otherwise; each asserts which path ran, so a lane without the kernels
@@ -52,10 +53,19 @@ def _rel_l2(got, want):
     return ((got.float() - want).norm() / want.norm()).item()
 
 
-def _inputs(batch, heads, q_seq, kv_seq, *, q_gain=1.0, negative_scores=False):
+def _inputs(
+    batch,
+    heads,
+    q_seq,
+    kv_seq,
+    *,
+    kv_heads=None,
+    q_gain=1.0,
+    negative_scores=False,
+):
     gen = torch.Generator().manual_seed(q_seq * 7919 + kv_seq)
     shape_q = (batch, heads, q_seq, 128)
-    shape_kv = (batch, heads, kv_seq, 128)
+    shape_kv = (batch, kv_heads or heads, kv_seq, 128)
     q = torch.randn(shape_q, generator=gen) * q_gain
     k = torch.randn(shape_kv, generator=gen)
     v = torch.randn(shape_kv, generator=gen)
@@ -69,8 +79,36 @@ def _inputs(batch, heads, q_seq, kv_seq, *, q_gain=1.0, negative_scores=False):
     return q.bfloat16(), k.bfloat16(), v.bfloat16()
 
 
+def _kernel_calls(graphs):
+    """``(flash, make_splash_mha)`` op calls in the FX graphs Dynamo compiled."""
+    names = [
+        str(node.target).split(".")[1]
+        for graph in graphs
+        for node in graph.graph.nodes
+        if node.op == "call_function"
+        and str(node.target).startswith("sglang_tpu_pallas.")
+    ]
+    return (
+        names.count("diffusion_flash_attention"),
+        names.count("diffusion_splash_mha"),
+    )
+
+
+# (flash, make_splash_mha) kernel calls of each path.
+_PATH_CALLS = {"flash": (1, 0), "splash": (0, 1), "sdpa": (0, 0)}
+
+
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuSplashAttentionNumerics(CustomTestCase):
+    def _kernels(self):
+        """The backend module with its ops registered; skips without them."""
+        from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
+
+        if not tsa._check_splash_available():
+            self.skipTest("Pallas kernels unavailable (needs TPU v7x and jax)")
+        tsa._register_ops()
+        return tsa
+
     def _check(
         self,
         batch,
@@ -81,27 +119,38 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         expect,
         is_causal=False,
         scale=128**-0.5,
+        attend=None,
         **kwargs,
     ):
-        """``expect`` is the path that must run: "flash", "splash" or "sdpa"."""
-        from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
+        """``expect`` is the path that must run: "flash", "splash" or "sdpa".
 
-        if not tsa._check_splash_available():
-            self.skipTest("Pallas kernels unavailable (needs TPU v7x and jax)")
-        tsa._register_ops()
+        ``attend(q, k, v)`` computes ``[B, H, S, D]`` attention from device
+        tensors; the default is ``tpu_attention``.
+        """
+        tsa = self._kernels()
+        if attend is None:
+
+            def attend(q, k, v):
+                return tsa.tpu_attention(q, k, v, scale=scale, is_causal=is_causal)
+
         q, k, v = _inputs(batch, heads, q_seq, kv_seq, **kwargs)
-        want = _reference(q, k, v, scale, is_causal)
-        q, k, v = q.to("tpu"), k.to("tpu"), v.to("tpu")
         with (
             patch.object(tsa, "_FLASH_OP", wraps=tsa._FLASH_OP) as flash,
             patch.object(tsa, "_SPLASH_MHA_OP", wraps=tsa._SPLASH_MHA_OP) as splash,
         ):
-            got = tsa.tpu_attention(q, k, v, scale=scale, is_causal=is_causal)
-        got = got.to("cpu")
-        ran = {"flash": (1, 0), "splash": (0, 1), "sdpa": (0, 0)}[expect]
-        self.assertEqual((flash.call_count, splash.call_count), ran, expect)
+            got = attend(q.to("tpu"), k.to("tpu"), v.to("tpu"))
+        calls = (flash.call_count, splash.call_count)
+        self.assertEqual(calls, _PATH_CALLS[expect], expect)
+        self._assert_accurate(got.to("cpu"), q, k, v, scale, is_causal)
+
+    def _assert_accurate(self, got, q, k, v, scale, is_causal):
+        """``got`` against float32 attention, within twice bf16 SDPA's error."""
+        if k.shape[1] != q.shape[1]:
+            k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+            v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
+        want = _reference(q, k, v, scale, is_causal)
         sdpa = F.scaled_dot_product_attention(
-            q, k, v, scale=scale, is_causal=is_causal
+            q.to("tpu"), k.to("tpu"), v.to("tpu"), scale=scale, is_causal=is_causal
         ).to("cpu")
         self.assertEqual(got.shape, want.shape)
         self.assertEqual(got.dtype, torch.bfloat16)
@@ -119,7 +168,7 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         self.assertLess(rel, max(1e-2, 2 * sdpa_rel), "rel-L2")
         self.assertLess(err, max(2e-2, 2 * sdpa_err), "max abs")
 
-    # Custom kernel: kv_seq >= 2048.
+    # Custom kernel: non-causal, q_seq >= 256, kv_seq >= 512.
     def test_custom_two_blocks_and_a_ragged_tail(self):
         # 4608 = 2 * 2048 + 512.
         self._check(1, 4, 4608, 4608, expect="flash")
@@ -159,28 +208,46 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
     def test_custom_negative_scores(self):
         self._check(1, 2, 4128, 4128, expect="flash", negative_scores=True)
 
-    # make_splash_mha, long query against short aligned KV.
+    # Text cross-attention on the custom kernel: long query, short KV.
     def test_cross_attention_aligned_kv(self):
-        self._check(1, 4, 4096, 512, expect="splash")
+        self._check(1, 4, 4096, 512, expect="flash")
+
+    def test_cross_attention_ragged_query(self):
+        # No block size divides 4100 query rows; the edge block is masked.
+        self._check(1, 4, 4100, 512, expect="flash")
+
+    def test_cross_attention_unaligned_kv(self):
+        # 600 keys: a ragged last KV block.
+        self._check(1, 2, 18900, 600, expect="flash", negative_scores=True)
+
+    def test_cross_attention_long_query(self):
+        # Short KV leaves VMEM for the largest query block.
+        self._check(1, 2, 37800, 512, expect="flash")
+
+    # make_splash_mha, long query against fewer than 512 aligned keys.
+    def test_splash_mha_cross_attention(self):
+        for kv_seq in (256, 384):
+            with self.subTest(kv_seq=kv_seq):
+                self._check(1, 2, 4096, kv_seq, expect="splash")
 
     def test_cross_attention_kv_not_multiple_of_1024(self):
-        self._check(1, 2, 4096, 1536, expect="splash", negative_scores=True)
+        self._check(1, 2, 4096, 1536, expect="flash", negative_scores=True)
 
-    # make_splash_mha, medium and causal shapes.
-    def test_medium_padded_kv_is_masked(self):
-        # 1000 pads to 1024: 24 zero keys that must stay masked.
-        self._check(1, 4, 1000, 1000, expect="splash", negative_scores=True)
+    # Medium shapes (custom kernel) and causal (make_splash_mha).
+    def test_medium_ragged_kv(self):
+        # 1000 keys: a ragged last KV block.
+        self._check(1, 4, 1000, 1000, expect="flash", negative_scores=True)
 
     def test_medium_aligned(self):
-        self._check(1, 2, 1024, 1024, expect="splash")
+        self._check(1, 2, 1024, 1024, expect="flash")
 
     def test_short_query_long_padded_kv(self):
-        # q_seq < 256 with kv >= 2048: make_splash_mha with segment-id masking.
+        # q_seq < 256 with kv > 512: make_splash_mha with segment-id masking.
         self._check(1, 2, 200, 4128, expect="splash", negative_scores=True)
 
     def test_long_query_unaligned_kv(self):
-        # 1024 < kv < 2048, not 128-aligned: KV padded to 1536, masked.
-        self._check(1, 2, 4096, 1500, expect="splash", negative_scores=True)
+        # 1024 < kv < 2048, not 128-aligned: a ragged last KV block.
+        self._check(1, 2, 4096, 1500, expect="flash", negative_scores=True)
 
     def test_causal_padded(self):
         self._check(1, 2, 1000, 1000, expect="splash", is_causal=True)
@@ -190,35 +257,13 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         self._check(1, 4, 300, 77, expect="sdpa")
 
     def test_unaligned_short_kv(self):
-        self._check(1, 2, 4096, 1000, expect="sdpa")
+        self._check(1, 2, 4096, 300, expect="sdpa")
 
     def test_gqa(self):
-        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
-            tpu_attention,
-        )
-
-        q, k, v = _inputs(1, 4, 4608, 4608)
-        k, v = k[:, :2], v[:, :2]
-        scale = 128**-0.5
-        want = _reference(
-            q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1), scale, False
-        )
-        got = tpu_attention(q.to("tpu"), k.to("tpu"), v.to("tpu"), scale=scale)
-        self.assertLess((got.to("cpu").float() - want).abs().max().item(), 2e-2)
+        self._check(1, 4, 4608, 4608, kv_heads=2, expect="flash")
 
     def test_gqa_make_splash_mha(self):
-        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
-            tpu_attention,
-        )
-
-        q, k, v = _inputs(1, 4, 4096, 512)
-        k, v = k[:, :2], v[:, :2]
-        scale = 128**-0.5
-        want = _reference(
-            q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1), scale, False
-        )
-        got = tpu_attention(q.to("tpu"), k.to("tpu"), v.to("tpu"), scale=scale)
-        self.assertLess((got.to("cpu").float() - want).abs().max().item(), 2e-2)
+        self._check(1, 4, 4096, 256, kv_heads=2, expect="splash")
 
     def test_varlen_segments_use_sdpa(self):
         from sglang_tpu.multimodal_gen import tpu_splash_attn
@@ -257,34 +302,27 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
 
     def test_backend_impl_layout(self):
         # The attention layer calls the impl with [B, S, H, D] tensors.
-        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
-            TpuSplashAttentionImpl,
-        )
-
-        impl = TpuSplashAttentionImpl(
+        tsa = self._kernels()
+        impl = tsa.TpuSplashAttentionImpl(
             num_heads=4, head_size=128, causal=False, softmax_scale=128**-0.5
         )
-        q, k, v = _inputs(1, 4, 4608, 4608)
-        want = _reference(q, k, v, 128**-0.5, False).transpose(1, 2)
-        got = impl.forward(
-            q.transpose(1, 2).to("tpu"),
-            k.transpose(1, 2).to("tpu"),
-            v.transpose(1, 2).to("tpu"),
-            None,
-        ).to("cpu")
-        self.assertEqual(got.shape, want.shape)
-        self.assertLess((got.float() - want).abs().max().item(), 2e-2)
+
+        def attend(q, k, v):
+            out = impl.forward(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), None
+            )
+            return out.transpose(1, 2)
+
+        self._check(1, 4, 4608, 4608, expect="flash", attend=attend)
 
     def test_torch_compile_output_layout(self):
         # Dynamo traces the op through its fake impl, whose strides must match
         # the kernel's contiguous output for the layer's reshape to lower.
         import torch_tpu._internal.compile  # noqa: F401
+        from torch._dynamo.testing import CompileCounterWithBackend
 
-        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
-            TpuSplashAttentionImpl,
-        )
-
-        impl = TpuSplashAttentionImpl(
+        tsa = self._kernels()
+        impl = tsa.TpuSplashAttentionImpl(
             num_heads=4, head_size=128, causal=False, softmax_scale=128**-0.5
         )
 
@@ -293,18 +331,24 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
             return out.reshape(out.shape[0], out.shape[1], -1)
 
         # Custom kernel, and make_splash_mha with a padded query.
-        for seq in (4608, 1000):
-            with self.subTest(seq=seq):
-                q, k, v = _inputs(1, 4, seq, seq)
-                want = _reference(q, k, v, 128**-0.5, False).transpose(1, 2)
-                compiled = torch.compile(attn, backend="tpu", dynamic=False)
+        for q_seq, kv_seq, expect in ((4608, 4608, "flash"), (200, 4128, "splash")):
+            with self.subTest(q_seq=q_seq, kv_seq=kv_seq):
+                q, k, v = _inputs(1, 4, q_seq, kv_seq)
+                torch._dynamo.reset()
+                # The tpu backend, recording the graphs it compiles: the
+                # kernel op must be in them, traced through its fake.
+                counter = CompileCounterWithBackend("tpu")
+                compiled = torch.compile(attn, backend=counter, dynamic=False)
                 # Contiguous [B, S, H, D], as the layer's projections produce.
                 got = compiled(
                     *(t.transpose(1, 2).contiguous().to("tpu") for t in (q, k, v))
                 ).to("cpu")
-                self.assertEqual(got.shape, (1, seq, 4 * 128))
-                err = (got.float() - want.reshape(1, seq, -1)).abs().max().item()
-                self.assertLess(err, 2e-2)
+                self.assertEqual(
+                    _kernel_calls(counter.graphs), _PATH_CALLS[expect], expect
+                )
+                self.assertEqual(got.shape, (1, q_seq, 4 * 128))
+                got = got.reshape(1, q_seq, 4, 128).transpose(1, 2)
+                self._assert_accurate(got, q, k, v, 128**-0.5, False)
 
     def test_float32_falls_back_to_sdpa(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
@@ -328,7 +372,9 @@ class TestTpuSplashDispatch(CustomTestCase):
 
         self.assertTrue(_use_custom_kernel(75600, 75600, False))
         self.assertTrue(_use_custom_kernel(880, 3520, False))
-        self.assertFalse(_use_custom_kernel(75600, 512, False))
+        self.assertTrue(_use_custom_kernel(18900, 512, False))
+        self.assertFalse(_use_custom_kernel(75600, 256, False))
+        self.assertFalse(_use_custom_kernel(200, 4128, False))
         self.assertFalse(_use_custom_kernel(4096, 4096, True))
 
     def test_cross_attn_block_kv_divides_kv(self):
@@ -341,12 +387,23 @@ class TestTpuSplashDispatch(CustomTestCase):
             self.assertEqual(kv_seq % block_kv, 0)
             self.assertLessEqual(block_kv, 1024)
 
+    def test_short_kv_query_blocks_are_capped(self):
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import (
+            autotune_block_sizes,
+        )
+
+        for q_seq, kv_seq in ((75600, 512), (37800, 512), (55800, 1024)):
+            self.assertLessEqual(autotune_block_sizes(q_seq, kv_seq)[0], 9472)
+        # Long KV: the VMEM model binds first.
+        self.assertEqual(autotune_block_sizes(75600, 75600), (6400, 2048, 2048))
+
     def test_splash_mha_blocks(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
             _splash_mha_block_sizes,
         )
 
-        self.assertEqual(_splash_mha_block_sizes(4096, 1536, False), (2048, 512))
+        self.assertEqual(_splash_mha_block_sizes(4096, 384, False), (2048, 128))
+        self.assertEqual(_splash_mha_block_sizes(4096, 256, False), (2048, 256))
         self.assertEqual(_splash_mha_block_sizes(4096, 4096, True), (1024, 1024))
         self.assertEqual(_splash_mha_block_sizes(1000, 1000, True), (512, 512))
         self.assertEqual(_splash_mha_block_sizes(200, 4128, False), (256, 256))
@@ -378,7 +435,8 @@ class TestTpuSplashDispatch(CustomTestCase):
             self.assertIsNone(reason((1, 4, 4608, 128), (1, 4, 4608, 128)))
             self.assertIsNone(reason((1, 4, 4096, 128), (1, 2, 512, 128)))
             self.assertEqual(reason((1, 4, 300, 128), (1, 4, 77, 128)), "short")
-            self.assertEqual(reason((1, 4, 4096, 128), (1, 4, 1000, 128)), "short")
+            self.assertEqual(reason((1, 4, 4096, 128), (1, 4, 300, 128)), "short")
+            self.assertIsNone(reason((1, 4, 18900, 128), (1, 4, 600, 128)))
             self.assertEqual(
                 reason((1, 4, 1000, 128), (1, 4, 2000, 128), is_causal=True),
                 "ragged causal",

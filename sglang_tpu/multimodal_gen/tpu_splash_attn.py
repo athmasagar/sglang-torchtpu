@@ -103,6 +103,9 @@ def autotune_block_sizes(
     mxu_dim = 256
     safe_kv_block = 2048
     vmem_budget = int(64 * (2**20) * 0.93)
+    # The VMEM model leaves out the double-buffered output block, which short
+    # KV leaves room for; cap block_q at the largest validated size.
+    max_block_q = 9472
 
     if q_seq < mxu_dim or kv_seq < mxu_dim:
         return 256, 256, 256
@@ -112,7 +115,7 @@ def autotune_block_sizes(
 
     vmem_max = mxu_dim
     bq = mxu_dim
-    while bq <= q_seq:
+    while bq <= min(q_seq, max_block_q):
         if _score_tile_bytes(bq, block_kv_compute, head_dim, block_kv) <= vmem_budget:
             vmem_max = bq
             bq += mxu_dim
@@ -136,8 +139,10 @@ def autotune_block_sizes(
 
 
 def _use_custom_kernel(q_seq: int, kv_seq: int, is_causal: bool) -> bool:
-    """Long-KV non-causal attention, including a short SP query shard."""
-    return (not is_causal) and q_seq >= 256 and kv_seq >= 2048
+    """Non-causal attention with at least 512 keys: long-KV self-attention, SP
+    query shards and text cross-attention. The kernel masks ragged edge
+    blocks, so no query or KV padding is needed."""
+    return (not is_causal) and q_seq >= 256 and kv_seq >= 512
 
 
 def _cross_attn_block_kv(kv_seq: int) -> int:
@@ -155,7 +160,7 @@ def _splash_mha_block_sizes(
     # Long query against short 128-aligned KV: block_kv divides kv_seq.
     if not is_causal and q_seq >= 2048 and kv_seq % 128 == 0:
         return 2048, _cross_attn_block_kv(kv_seq)
-    # Medium and causal attention.
+    # Causal attention, and short queries against long KV.
     if q_seq % 1024 == 0 and kv_seq % 1024 == 0:
         return 1024, 1024
     if q_seq >= 512 and kv_seq >= 512:
@@ -406,11 +411,12 @@ def _sdpa_fallback_reason(
     q_seq, kv_seq = query.shape[2], key.shape[2]
     if q_seq == 0 or kv_seq == 0:
         return "empty"
-    # Short sequences and unaligned short-KV cross-attention stay on SDPA.
+    # Short sequences, and cross-attention to fewer than 512 keys that
+    # make_splash_mha cannot block without padding, stay on SDPA.
     if (q_seq <= 512 and kv_seq <= 512) or (
         not is_causal
         and q_seq != kv_seq
-        and kv_seq <= 1024
+        and kv_seq < 512
         and (q_seq < 2048 or kv_seq % 128 != 0)
     ):
         return "short"
