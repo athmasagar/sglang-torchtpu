@@ -158,10 +158,12 @@ class Platform:
         """Return the backend used to compile diffusion modules."""
         return self.simple_compile_backend
 
-    def get_spmd_region_wrapper(self) -> Callable | None:
+    def prepare_spmd_region_wrapper(self) -> Callable | None:
         """Decorator for --regional-compile regions that every rank runs with the
         same graph (the model sets ``_compile_regions_spmd_safe``). The regions
-        should trace as one graph each."""
+        should trace as one graph each. May configure process-wide compile
+        state the wrapper needs (e.g. a cache-key tag); call it once, before
+        compiling."""
         return None
 
     def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:

@@ -121,7 +121,7 @@ def compile_matching_submodules(
 
     # Only for models whose ranks all run the same region graph.
     wrap_region = (
-        current_platform.get_spmd_region_wrapper()
+        current_platform.prepare_spmd_region_wrapper()
         if getattr(module, "_compile_regions_spmd_safe", False)
         else None
     )

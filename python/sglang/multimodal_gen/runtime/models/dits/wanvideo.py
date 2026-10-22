@@ -1265,7 +1265,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 batch_size, self.sp_size, local_seq_len, hidden_states.shape[2]
             )
             # A fresh shard: a view starts at a rank-dependent storage offset,
-            # which torch_tpu keys compiled executables on.
+            # which torch_tpu keys compiled executables on. Unconditional on
+            # purpose: the copy is negligible elsewhere and keeps one trace on
+            # every platform.
             hidden_states = hidden_states[:, sp_rank, :, :].clone(
                 memory_format=torch.contiguous_format
             )

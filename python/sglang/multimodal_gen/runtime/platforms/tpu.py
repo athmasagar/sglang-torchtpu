@@ -209,7 +209,7 @@ class TpuPlatform(Platform):
     def get_device(self, local_rank: int) -> torch.device:
         return self.get_local_torch_device()
 
-    def get_spmd_region_wrapper(self) -> Callable | None:
+    def prepare_spmd_region_wrapper(self) -> Callable | None:
         # torch_tpu splits a compiled graph at every collective and re-lays out
         # tensors at each split. Marking a region SPMD-safe keeps its
         # collectives in one program. A whole-DiT program needs too much

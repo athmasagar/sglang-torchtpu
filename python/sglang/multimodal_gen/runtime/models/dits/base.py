@@ -29,7 +29,7 @@ class BaseDiT(nn.Module, ABC):
     _compile_conditions: list = []
     # True only if every SP rank runs each _compile_conditions region with the
     # same shapes, strides and storage offsets: the platform may then keep a
-    # region's collectives in one compiled program (get_spmd_region_wrapper),
+    # region's collectives in one compiled program (prepare_spmd_region_wrapper),
     # which hangs or exchanges wrong data when the ranks' programs differ.
     _compile_regions_spmd_safe: bool = False
     # Methods that drive a forward pass without going through __call__. FSDP2

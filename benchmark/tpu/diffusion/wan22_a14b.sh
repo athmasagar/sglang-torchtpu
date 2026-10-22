@@ -7,5 +7,5 @@ set -euo pipefail
 export MODEL="${MODEL:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"
 export NUM_GPUS="${NUM_GPUS:-8}"
 export PARALLEL_ARGS="${PARALLEL_ARGS---cfg-parallel-size 2 --ulysses-degree 2 --ring-degree 2}"
-export MODEL_ARGS="${MODEL_ARGS---regional-compile --dit-layerwise-offload false}"
+export MODEL_ARGS="${MODEL_ARGS---regional-compile}"
 exec bash "$(dirname "$0")/launch.sh" "$@"

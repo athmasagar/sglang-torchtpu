@@ -6,6 +6,8 @@ text encoder, the highest TPU clock and a 65536 KiB scoped-VMEM limit for XLA fu
 64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than without it); see `launch.sh`. The Wan
 recipes compile per transformer block (`--regional-compile`), which keeps each block's collectives inside its program,
 and run Ulysses across the two cores of a chip with a K/V all-gather ring across chips.
+That placement relies on Ulysses groups being contiguous ranks (ring groups are strided, see `parallelism.mdx`) and on
+ranks 2k and 2k+1 being the two cores of one chip, as in the default `--num-gpus 8` device order.
 
 | Recipe | Model | Cores | Parallelism |
 | :--- | :--- | :---: | :--- |
@@ -62,9 +64,20 @@ curl -s -X POST http://localhost:30000/v1/images/generations -H "Content-Type: a
 download `GET /v1/videos/{id}/content`. Image-to-video requests (Wan2.2-I2V-A14B, Wan2.2-TI2V-5B) add
 `"input_reference": "<path or URL>"`.
 
+LTX-2 (`ltx2.sh`):
+
 ```bash
 curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
   "prompt": "A fluffy golden dog sits centered in frame against a soft pastel background, looking into the camera",
   "size": "1280x720", "num_frames": 121, "num_inference_steps": 40, "guidance_scale": 4.0, "seed": 42
+}'
+```
+
+Wan2.2-TI2V-5B (`wan22_ti2v_5b.sh`):
+
+```bash
+curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
+  "prompt": "A fluffy golden dog sits centered in frame against a soft pastel background, looking into the camera",
+  "size": "1280x704", "num_frames": 121, "num_inference_steps": 20, "seed": 42
 }'
 ```

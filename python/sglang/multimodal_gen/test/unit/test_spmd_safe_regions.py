@@ -63,7 +63,7 @@ def _wrap_region(forward):
 class TestSpmdSafeRegions(unittest.TestCase):
     def _compile(self, model, compile_kwargs):
         with patch(f"{_COMPILE}.current_platform") as platform:
-            platform.get_spmd_region_wrapper.return_value = _wrap_region
+            platform.prepare_spmd_region_wrapper.return_value = _wrap_region
             compile_matching_submodules(model, compile_kwargs=compile_kwargs)
 
     def test_marked_regions_are_wrapped_then_compiled_as_requested(self):
@@ -84,7 +84,7 @@ class TestSpmdSafeRegions(unittest.TestCase):
             self.assertEqual(kwargs, {"backend": "tpu", "fullgraph": False})
 
     def test_regions_are_unwrapped_unless_the_model_opts_in(self):
-        self.assertIsNone(Platform().get_spmd_region_wrapper())
+        self.assertIsNone(Platform().prepare_spmd_region_wrapper())
         self.assertFalse(BaseDiT._compile_regions_spmd_safe)
         self.assertTrue(wanvideo.WanTransformer3DModel._compile_regions_spmd_safe)
 
@@ -111,7 +111,9 @@ class TestSpmdSafeRegions(unittest.TestCase):
                 compiler_config.patch(cache_key_tag=user_tag),
             ):
                 for _ in range(2):
-                    self.assertIs(TpuPlatform().get_spmd_region_wrapper(), spmd_safe)
+                    self.assertIs(
+                        TpuPlatform().prepare_spmd_region_wrapper(), spmd_safe
+                    )
                 self.assertEqual(compiler_config.cache_key_tag, expected)
 
     def test_torch_tpu_without_spmd_safe_leaves_regions_unwrapped(self):
@@ -121,7 +123,7 @@ class TestSpmdSafeRegions(unittest.TestCase):
             patch.dict(sys.modules, self._torch_tpu_stubs()),
             compiler_config.patch(cache_key_tag="user"),
         ):
-            self.assertIsNone(TpuPlatform().get_spmd_region_wrapper())
+            self.assertIsNone(TpuPlatform().prepare_spmd_region_wrapper())
             self.assertEqual(compiler_config.cache_key_tag, "user")
 
     @unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires torch_tpu")
@@ -129,11 +131,17 @@ class TestSpmdSafeRegions(unittest.TestCase):
         from torch_tpu._internal.distributed.spmd_util import spmd_safe
 
         with compiler_config.patch(cache_key_tag=""):
-            self.assertIs(TpuPlatform().get_spmd_region_wrapper(), spmd_safe)
+            self.assertIs(TpuPlatform().prepare_spmd_region_wrapper(), spmd_safe)
 
 
 class _Stop(Exception):
     """Ends the forward once block 0's inputs are recorded."""
+
+
+# Rank-local entries of the shared tail-pad meta. Only the CUDA varlen-FA
+# K/V-gather path reads it; the paths compiled in spmd_safe regions mask from
+# the global pad_start/pad_end instead.
+_RANK_LOCAL_META_KEYS = frozenset({"local_pad"})
 
 
 class _RecordingBlock(nn.Module):
@@ -144,19 +152,36 @@ class _RecordingBlock(nn.Module):
             for leaf in tree_leaves((args, kwargs))
             if isinstance(leaf, torch.Tensor)
         ]
+        # Dynamo specializes on Python scalars it reads, so a rank-dependent
+        # scalar changes the program even when every tensor layout matches.
+        meta = kwargs.get("attn_mask_meta") or {}
+        rest = {k: v for k, v in kwargs.items() if k != "attn_mask_meta"}
+        self.scalars = (
+            [
+                leaf
+                for leaf in tree_leaves((args, rest))
+                if not isinstance(leaf, torch.Tensor)
+            ],
+            {
+                key: value
+                for key, value in meta.items()
+                if not isinstance(value, torch.Tensor)
+                and key not in _RANK_LOCAL_META_KEYS
+            },
+        )
         raise _Stop
 
 
 @contextlib.contextmanager
-def _sp_rank(rank, world_size):
+def _sp_rank(rank, world_size, ring_world_size=1):
     tp_group = SimpleNamespace(
         world_size=1, rank_in_group=0, all_gather=lambda x, dim=-1: x
     )
     sp_group = SimpleNamespace(
         world_size=world_size,
         rank_in_group=rank,
-        ulysses_world_size=world_size,
-        ring_world_size=1,
+        ulysses_world_size=world_size // ring_world_size,
+        ring_world_size=ring_world_size,
     )
     with (
         patch.object(parallel_state, "_TP", tp_group),
@@ -250,6 +275,47 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
             # Same shapes, strides and offsets for every tensor on every rank.
             for rank, layout in enumerate(layouts):
                 self.assertEqual(layout, layouts[0], f"rank {rank}")
+
+    def test_padded_shards_feed_every_rank_the_same_program_inputs(self):
+        # 3 x 3 x 3 = 27 latent tokens at SP 4: 7 per rank, one pad token at
+        # the last rank's tail. Ulysses 4, and Ulysses 2 x ring 2.
+        world_size = 4
+        forward_batch = SimpleNamespace(
+            enable_sequence_shard=True, enable_teacache=False, enable_spectrum=False
+        )
+        context = SimpleNamespace(forward_batch=forward_batch, attn_metadata=None)
+        for ring_world_size, batch in ((1, 1), (2, 1), (2, 2)):
+            latents = torch.randn(batch, 4, 3, 6, 6)
+            text = torch.randn(batch, 5, 8)
+            timestep = torch.full((batch, 27), 500.0)
+            layouts, scalars = [], []
+            for rank in range(world_size):
+                case = dict(ring=ring_world_size, batch=batch, rank=rank)
+                with (
+                    self.subTest(**case),
+                    _sp_rank(rank, world_size, ring_world_size),
+                ):
+                    model = _tiny_wan()
+                    block = _RecordingBlock()
+                    model.blocks = nn.ModuleList([block])
+                    with (
+                        patch.object(
+                            wanvideo, "get_forward_context", return_value=context
+                        ),
+                        self.assertRaises(_Stop),
+                    ):
+                        model(latents, text, timestep)
+                    layouts.append(block.layouts)
+                    scalars.append(block.scalars)
+                    hidden_states, _, temb, _ = block.args
+                    for tensor in (hidden_states, temb):
+                        self.assertEqual(tensor.storage_offset(), 0)
+                        self.assertTrue(tensor.is_contiguous())
+            for rank in range(world_size):
+                self.assertEqual(layouts[rank], layouts[0], f"rank {rank}")
+                self.assertEqual(scalars[rank], scalars[0], f"rank {rank}")
+            # The global pad span is what the attention paths read.
+            self.assertEqual(scalars[0][1]["pad_start"], 27)
 
 
 if __name__ == "__main__":

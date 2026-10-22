@@ -1365,7 +1365,11 @@ class USPAttention(nn.Module):
                 out = self.attn_impl.forward(
                     q, k[:, :meta_pad_start], v[:, :meta_pad_start], ctx_attn_metadata
                 )
-                out[:, meta_pad_start:] = 0
+                # Not an in-place write into the impl's output buffer.
+                real_rows = (
+                    torch.arange(out.shape[1], device=out.device) < meta_pad_start
+                )
+                out = torch.where(real_rows[None, :, None, None], out, 0)
                 if sp_size > 1:
                     out = _usp_output_all_to_all(out, head_dim=2)
                 return out
