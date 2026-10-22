@@ -242,8 +242,8 @@ class TestTorchTpuIntegration(unittest.TestCase):
         self.assertFalse(torch.tpu.is_initialized())
 
     def test_srt_symbols_the_platform_imports_exist(self):
-        # tpu.py imports this lazily; a rename on the srt side must fail here,
-        # not at worker bootstrap.
+        # The plugin's worker hooks import this lazily; a rename on the srt
+        # side must fail here, not at worker bootstrap.
         from sglang_tpu.patches import _prepare_tpu_env
 
         self.assertTrue(callable(_prepare_tpu_env))

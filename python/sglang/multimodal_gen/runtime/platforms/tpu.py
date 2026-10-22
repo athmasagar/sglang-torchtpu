@@ -45,39 +45,11 @@ def _memory_stat(key: str) -> int:
     return int(torch.accelerator.memory_stats().get(key, 0))
 
 
-def _add_compiler_flags_to_compile_cache_key() -> None:
-    import hashlib
-    from importlib import metadata
+def _tpu_plugin():
+    """The plugin's worker hooks: this platform's one import of sglang_tpu."""
+    from sglang_tpu.multimodal_gen import worker
 
-    import torch.compiler.config as compiler_config
-
-    def version(dist: str) -> str:
-        try:
-            return metadata.version(dist)
-        except metadata.PackageNotFoundError:
-            return ""
-
-    flags = [
-        os.environ.get(name, "")
-        for name in (
-            "LIBTPU_INIT_ARGS",
-            "XLA_FLAGS",
-            "TORCH_TPU_INTERNAL_XLA_OPTIONS",
-            # Read at compile time: where torch_tpu splits graphs at collectives.
-            "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-        )
-    ]
-    # A persisted executable is stale across compiler releases and chip kinds,
-    # and the rank-assignment tag (multi-worker launches only) leaves the slice
-    # shape of a single-worker launch out.
-    flags += [version(dist) for dist in ("torch_tpu", "libtpu", "jax", "jaxlib")]
-    flags += [TpuPlatform.get_device_name(), os.environ.get("TORCH_TPU_TOPOLOGY", "")]
-    digest = hashlib.sha256("\0".join(flags).encode()).hexdigest()[:16]
-    tag = f"tpu-compiler-v2:{digest}"
-    # '|'-joined and idempotent, like srt's compile_cache tags.
-    existing_tag = str(compiler_config.cache_key_tag or "")
-    if tag not in existing_tag.split("|"):
-        compiler_config.cache_key_tag = f"{existing_tag}|{tag}" if existing_tag else tag
+    return worker
 
 
 def _install_device_module_shims() -> None:
@@ -196,10 +168,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _init_worker_process(cls) -> None:
-        from sglang_tpu.patches import (
-            _patch_set_device_tolerate_mismatch,
-            _prepare_tpu_env,
-        )
+        plugin = _tpu_plugin()
 
         # srt's activate() selects CPU-only JAX for TorchTPU processes; the
         # worker cannot rely on that having run in the parent (entry-point
@@ -210,14 +179,13 @@ class TpuPlatform(Platform):
         os.environ.setdefault(
             "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
         )
-        _prepare_tpu_env(world_size=_world_size(), resolve_single_host_topology=True)
+        plugin.prepare_env(_world_size())
         import torch_tpu  # noqa: F401
 
         # Registers the "tpu" dynamo backend that simple_compile_backend names.
         import torch_tpu._internal.compile  # noqa: F401
 
-        # PJRT owns the chiplet binding; local_rank is only a label.
-        _patch_set_device_tolerate_mismatch()
+        plugin.install_runtime_patches()
 
         _install_device_module_shims()
         torch.zeros(1, device="tpu")
@@ -226,14 +194,7 @@ class TpuPlatform(Platform):
         # torch_tpu persists XLA executables in AOTAutogradCache, whose key sees
         # neither the device assignment behind collectives, opaque Pallas kernel
         # sources nor the XLA flags: a stale hit can hang or ignore new flags.
-        from sglang_tpu.compile_cache import (
-            add_tpu_kernel_inputs_to_compile_cache_key,
-            add_tpu_rank_assignment_to_compile_cache_key,
-        )
-
-        add_tpu_rank_assignment_to_compile_cache_key()
-        add_tpu_kernel_inputs_to_compile_cache_key()
-        _add_compiler_flags_to_compile_cache_key()
+        _tpu_plugin().configure_compile_cache()
 
     def get_torch_distributed_backend_str(self) -> str:
         # tpu_dist needs one addressable PJRT device; a lone worker has many.
@@ -272,8 +233,9 @@ class TpuPlatform(Platform):
     @classmethod
     def supports_vae_torch_compile(cls) -> bool:
         # Off for every VAE: the torch_tpu backend fails to compile the diffusers
-        # AutoencoderKL decoder (torch-tpu 0.1.1+release.2026.9.22), and the other
-        # VAEs are untested under it.
+        # AutoencoderKL decoder (torch_tpu 0.2.0rc4, libtpu 0.0.50: view() cannot
+        # turn a channels-last [1, 512, 128, 128] activation into [1, 32, 262144]),
+        # and the other VAEs are untested under it.
         return False
 
     @classmethod

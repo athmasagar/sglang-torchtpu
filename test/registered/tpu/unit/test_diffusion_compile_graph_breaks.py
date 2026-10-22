@@ -1,4 +1,5 @@
-"""TPU CI entry for the diffusion torch.compile graph-break and recompile tests."""
+"""TPU CI entry for the diffusion torch.compile arguments, graph-break and
+recompile tests."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
@@ -9,6 +10,7 @@ import unittest
 from sglang.multimodal_gen.test.unit.test_compile_graph_breaks import (  # noqa: F401
     TestCompileGraphBreaks,
     TestDenoisingStepTimestep,
+    TestTpuCompileKwargs,
     TestWanStepCounter,
 )
 

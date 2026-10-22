@@ -12,12 +12,8 @@ from sglang.multimodal_gen.runtime.managers import gpu_worker
 from sglang.multimodal_gen.runtime.platforms.interface import Platform
 from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
 
-_FLAGS = (
-    "LIBTPU_INIT_ARGS",
-    "XLA_FLAGS",
-    "TORCH_TPU_INTERNAL_XLA_OPTIONS",
-    "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-)
+_KERNEL_INPUTS_TAG = r"^tpu-kernel-inputs-v1:[0-9a-f]{64}$"
+_RANK_ASSIGNMENT_TAG = r"^tpu-rank-assignment-v1:[0-9a-f]{64}$"
 
 
 class TestCompileCacheHook(unittest.TestCase):
@@ -75,11 +71,13 @@ class TestCompileCacheHook(unittest.TestCase):
 
 
 class TestTpuCompileCacheKey(unittest.TestCase):
-    def _tags(self, world_size=1, existing="user-tag", **env):
+    """The TPU worker adds sglang_tpu's compile-cache tags; what each tag
+    digests is covered by sglang_tpu's compile_cache tests."""
+
+    def _tags(self, world_size=1, existing="user-tag"):
         device_mesh = ModuleType("torch_tpu._internal.distributed.device_mesh")
         device_mesh.get_device_assignment = lambda: list(range(world_size))
         with (
-            patch.dict(os.environ, {name: env.get(name, "") for name in _FLAGS}),
             patch.dict(sys.modules, {device_mesh.__name__: device_mesh}),
             patch("torch.distributed.get_world_size", return_value=world_size),
             patch("torch.distributed.get_rank", return_value=0),
@@ -88,53 +86,20 @@ class TestTpuCompileCacheKey(unittest.TestCase):
             TpuPlatform().configure_compile_cache()
             return compiler_config.cache_key_tag.split("|")
 
-    def test_key_keeps_user_tags_and_adds_pallas_sources_and_flags(self):
-        user, pallas_sources, flags = self._tags()
+    def test_one_worker_keeps_user_tags_and_adds_the_kernel_inputs(self):
+        user, kernel_inputs = self._tags()
         self.assertEqual(user, "user-tag")
-        self.assertRegex(pallas_sources, r"^tpu-kernel-inputs-v1:[0-9a-f]{64}$")
-        self.assertRegex(flags, r"^tpu-compiler-v2:[0-9a-f]{16}$")
+        self.assertRegex(kernel_inputs, _KERNEL_INPUTS_TAG)
 
-    def test_key_covers_the_rank_assignment_of_a_multi_worker_launch(self):
-        self.assertFalse(
-            any(tag.startswith("tpu-rank-assignment-v1:") for tag in self._tags())
-        )
-        self.assertTrue(
-            any(
-                tag.startswith("tpu-rank-assignment-v1:")
-                for tag in self._tags(world_size=4)
-            )
-        )
+    def test_multi_worker_launch_adds_the_rank_assignment(self):
+        user, rank_assignment, kernel_inputs = self._tags(world_size=4)
+        self.assertEqual(user, "user-tag")
+        self.assertRegex(rank_assignment, _RANK_ASSIGNMENT_TAG)
+        self.assertRegex(kernel_inputs, _KERNEL_INPUTS_TAG)
 
-    def test_flags_tag_tracks_every_flag_and_is_added_once(self):
-        flags_tag = self._tags()[-1]
-        for name in _FLAGS:
-            with self.subTest(name=name):
-                self.assertNotEqual(self._tags(**{name: "--x=1"})[-1], flags_tag)
-        tagged = "|".join(self._tags())
-        self.assertEqual(self._tags(existing=tagged).count(flags_tag), 1)
-
-    def test_flags_tag_tracks_compiler_versions_chip_and_topology(self):
-        from importlib import metadata
-
-        flags_tag = self._tags()[-1]
-        real_version = metadata.version
-        for dist in ("torch_tpu", "libtpu", "jax", "jaxlib"):
-            with self.subTest(dist=dist):
-
-                def bumped(name, dist=dist):
-                    if name == dist:
-                        return "999.0"
-                    try:
-                        return real_version(name)
-                    except metadata.PackageNotFoundError:
-                        return ""
-
-                with patch("importlib.metadata.version", side_effect=bumped):
-                    self.assertNotEqual(self._tags()[-1], flags_tag)
-        with patch.object(TpuPlatform, "get_device_name", return_value="TPU v0"):
-            self.assertNotEqual(self._tags()[-1], flags_tag)
-        with patch.dict(os.environ, {"TORCH_TPU_TOPOLOGY": "4x4x4"}):
-            self.assertNotEqual(self._tags()[-1], flags_tag)
+    def test_reconfiguring_keeps_one_tag_of_each_kind(self):
+        tags = self._tags(world_size=4)
+        self.assertEqual(self._tags(world_size=4, existing="|".join(tags)), tags)
 
 
 if __name__ == "__main__":

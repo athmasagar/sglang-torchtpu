@@ -15,7 +15,11 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
     OneDRotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    build_torch_compile_kwargs,
+)
 
 
 def _compile(fn):
@@ -254,6 +258,54 @@ class TestWanStepCounter(unittest.TestCase):
                             torch.tensor([t]),
                         )
                 self.assertEqual(model.cnt, expected)
+
+
+class TestTpuCompileKwargs(unittest.TestCase):
+    """What the TPU platform compiles, and with which arguments."""
+
+    def test_tpu_compiles_static_shapes_with_platform_backend(self):
+        compile_path = "sglang.multimodal_gen.runtime.utils.torch_compile"
+        with (
+            patch(
+                f"{compile_path}.current_platform.is_out_of_tree",
+                return_value=False,
+            ),
+            patch(f"{compile_path}.current_platform.is_tpu", return_value=True),
+            patch(
+                f"{compile_path}.current_platform.get_compile_backend",
+                return_value="tpu",
+            ) as get_compile_backend,
+        ):
+            compile_kwargs = build_torch_compile_kwargs(
+                mode="max-autotune-no-cudagraphs",
+                module=torch.nn.Module(),
+                enable_inductor_compute_comm_overlap=True,
+            )
+
+        self.assertEqual(
+            compile_kwargs, {"backend": "tpu", "dynamic": False, "fullgraph": False}
+        )
+        get_compile_backend.assert_called_once_with("max-autotune-no-cudagraphs")
+
+    def test_vae_decode_stays_eager_where_the_platform_cannot_compile_it(self):
+        stage = DecodingStage.__new__(DecodingStage)
+        decode = MagicMock()
+        compiled_callable = MagicMock(target_id=None, compiled_module=None)
+        module_path = "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding"
+
+        with patch(
+            f"{module_path}.current_platform.supports_vae_torch_compile",
+            return_value=False,
+        ):
+            result = stage._get_vae_decode_fn(
+                torch.nn.Module(),
+                SimpleNamespace(enable_torch_compile=True),
+                decode_fn=decode,
+                compiled_callable=compiled_callable,
+            )
+
+        self.assertIs(result, decode)
+        compiled_callable.get_or_compile.assert_not_called()
 
 
 if __name__ == "__main__":
