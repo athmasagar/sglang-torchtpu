@@ -85,11 +85,16 @@ class TestInstall(CustomTestCase):
         scheduler = self.cls()
         with (
             patch.object(tpu, "trim_host_heap", side_effect=scheduler.calls.append),
+            patch.object(
+                tpu.jax,
+                "clear_caches",
+                side_effect=lambda: scheduler.calls.append("clear JAX"),
+            ),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
         ):
             self.assertEqual(scheduler.handle_freeze_gc("req"), "forwarded")
-        self.assertEqual(scheduler.calls, ["req", "after warmup"])
+        self.assertEqual(scheduler.calls, ["clear JAX", "req", "after warmup"])
         self.assertIsNone(tpu._periodic_thread)
 
     def test_collects_cycles_before_the_handler_freezes_them(self):
@@ -102,7 +107,7 @@ class TestInstall(CustomTestCase):
         del node
         with (
             patch.object(tpu, "trim_host_heap"),
-            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
         ):
             self.cls().handle_freeze_gc("req")

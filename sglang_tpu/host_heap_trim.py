@@ -26,6 +26,7 @@ import threading
 import time
 from typing import Callable, Optional, Tuple
 
+import jax
 import msgspec
 
 from sglang.srt.runtime_context import get_parallel
@@ -150,9 +151,11 @@ def _stop_periodic() -> None:
 
 
 def _before_freeze() -> None:
-    if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
-        # gc.freeze() keeps any cycle it sees forever, so collect first.
-        gc.collect()
+    # Serving executables are owned by TorchTPU; discard JAX tracing caches.
+    jax.clear_caches()
+    # gc.freeze() keeps any cycle it sees forever, so collect first even if
+    # returning allocator pages is disabled.
+    gc.collect()
 
 
 def _after_freeze() -> None:
