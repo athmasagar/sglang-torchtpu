@@ -2,8 +2,9 @@
 """TPU Pallas attention backend (``--attention-backend tpu_splash_attn``).
 
 A flash attention kernel with an online exp2 softmax and a v7x block-size
-model for long-KV attention, and JAX's ``make_splash_mha`` for short-KV and
-causal attention. Both run as ``cpu_export_jax_op`` torch ops; block sizes,
+model for non-causal attention over at least 512 keys, and JAX's
+``make_splash_mha`` for causal attention, queries shorter than 256 rows and
+cross-attention to fewer than 512 aligned keys. Both run as ``cpu_export_jax_op`` torch ops; block sizes,
 padding and query scaling are resolved inside the jitted JAX function from the
 static shapes.
 """
@@ -26,7 +27,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-LOG2_E = 1.44269504
+LOG2_E = math.log2(math.e)
 NUM_SUBLANES = 8
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))
 # Block sizes and the VMEM model below are tuned and validated on v7x only.
@@ -38,6 +39,21 @@ _logged_sdpa_fallbacks: set[tuple] = set()
 _FLASH_OP = None
 _SPLASH_MHA_OP = None
 _OPS_LOCK = threading.Lock()
+_resolved_mode_logged = False
+
+
+def _log_resolved_mode_once(use_splash: bool, dropout: float) -> None:
+    global _resolved_mode_logged
+    if _resolved_mode_logged:
+        return
+    _resolved_mode_logged = True
+    if use_splash:
+        logger.info("TPU splash attention: splash=on (per-shape SDPA fallback).")
+    else:
+        reason = f"dropout={dropout}" if dropout != 0.0 else "kernels unavailable"
+        logger.info(
+            "TPU splash attention: splash=off (%s); every call uses SDPA.", reason
+        )
 
 
 def _check_splash_available() -> bool:
@@ -73,7 +89,20 @@ def _round_up(x: int, multiple: int) -> int:
 
 
 def _round_down(x: int, multiple: int) -> int:
+    """Round ``x`` down to a multiple, but never below one ``multiple``.
+
+    For ``x < multiple`` this rounds *up* to ``multiple``.
+    """
     return max((x // multiple) * multiple, multiple)
+
+
+# TPU v7x VMEM per TensorCore. The kernel passes the live
+# ``get_tpu_info().vmem_capacity_bytes`` to both the block-size model and
+# Mosaic's ``vmem_limit_bytes``; this default serves CPU-side callers.
+_V7X_VMEM_CAPACITY_BYTES = 64 * 2**20
+# Headroom for buffers the model does not count, chiefly the double-buffered
+# bf16 output block (3.1 MiB at block_q=6400).
+_VMEM_BUDGET_FRACTION = 0.93
 
 
 def _score_tile_bytes(
@@ -90,21 +119,25 @@ def _score_tile_bytes(
     return score_f32 + qkv_2x + output_f32 + max_sum_scratch
 
 
-def autotune_block_sizes(
+def _autotune_block_sizes(
     q_seq: int,
     kv_seq: int,
     head_dim: int = 128,
+    vmem_capacity_bytes: int = _V7X_VMEM_CAPACITY_BYTES,
 ) -> tuple[int, int, int]:
     """``(block_q, block_kv, block_kv_compute)`` of the flash kernel on TPU v7x.
 
     Minimizes grid-cell cost under a VMEM budget, keeping at least two query
-    blocks per head.
+    blocks per head. The VMEM model holds on v7x only.
     """
     mxu_dim = 256
     safe_kv_block = 2048
-    vmem_budget = int(64 * (2**20) * 0.93)
-    # The VMEM model leaves out the double-buffered output block, which short
-    # KV leaves room for; cap block_q at the largest validated size.
+    vmem_budget = int(vmem_capacity_bytes * _VMEM_BUDGET_FRACTION)
+    # Cap block_q: the VMEM model leaves out the double-buffered bf16 output
+    # block (4 * block_q * head_dim bytes). For short KV the model alone would
+    # allow block_q up to ~19.7k at block_kv=512 and overflow once that block
+    # is added. 9472 is the largest size validated on device (37800x512,
+    # 18900x600).
     max_block_q = 9472
 
     if q_seq < mxu_dim or kv_seq < mxu_dim:
@@ -146,11 +179,12 @@ def _use_custom_kernel(q_seq: int, kv_seq: int, is_causal: bool) -> bool:
 
 
 def _cross_attn_block_kv(kv_seq: int) -> int:
-    """Largest KV block <= 1024 dividing ``kv_seq`` (a multiple of 128)."""
-    for block_kv in (1024, 512, 256):
-        if kv_seq % block_kv == 0:
-            return block_kv
-    return 128
+    """KV block dividing ``kv_seq``, a multiple of 128 below 512.
+
+    Only kv in {128, 256, 384} reaches here: 512 or more keys go to the
+    custom kernel.
+    """
+    return 256 if kv_seq % 256 == 0 else 128
 
 
 def _splash_mha_block_sizes(
@@ -184,7 +218,11 @@ def _flash_attention(q, k, v, scale):
     num_q_heads, q_seq, head_dim = q.shape[1:]
     num_kv_heads, kv_seq = k.shape[1], k.shape[2]
     q_heads_per_kv_head = num_q_heads // num_kv_heads
-    block_q, block_kv, block_kv_compute = autotune_block_sizes(q_seq, kv_seq, head_dim)
+    # One VMEM figure feeds both the block-size model and Mosaic's limit.
+    vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    block_q, block_kv, block_kv_compute = _autotune_block_sizes(
+        q_seq, kv_seq, head_dim, vmem_capacity_bytes
+    )
     grid_width = pl.cdiv(kv_seq, block_kv)
     qk_scale = scale * LOG2_E
     mask_value = -0.7 * float(jnp.finfo(jnp.float32).max)
@@ -279,7 +317,7 @@ def _flash_attention(q, k, v, scale):
                 dimension_semantics=("parallel", "parallel", "arbitrary"),
                 flags={"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True},
                 # Autotuned score tiles exceed Mosaic's 32 MiB default.
-                vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+                vmem_limit_bytes=vmem_capacity_bytes,
             ),
             out_shape=jax.ShapeDtypeStruct((num_q_heads, q_seq, head_dim), q_3d.dtype),
             name="diffusion_flash_attention",
@@ -318,6 +356,10 @@ def _splash_mha(q, k, v, scale, is_causal):
         block_kv,
     )
 
+    # make_splash_mha takes no scale, so q is pre-scaled and rounded to bf16:
+    # up to 2^-9 relative error per element, which the flash kernel avoids by
+    # scaling its f32 scores. The extra error grows with the logit spread
+    # (test_splash_high_logit_gain bounds it).
     q = (q.astype(jnp.float32) * scale).astype(k.dtype)
     if num_q_heads != num_kv_heads:
         k = jnp.repeat(k, num_q_heads // num_kv_heads, axis=1)
@@ -367,40 +409,54 @@ def _add_kernel_source_to_compile_cache_key() -> None:
 
 
 def _register_ops() -> None:
-    """Create the kernel ops; must run before torch.compile traces a model."""
-    global _FLASH_OP, _SPLASH_MHA_OP
-    if _FLASH_OP is not None:
+    """Create the kernel ops; must run before torch.compile traces a model.
+
+    A failure marks the kernels unavailable, so callers fall back to SDPA
+    instead of retrying a half-registered ``torch.library`` op.
+    """
+    global _FLASH_OP, _SPLASH_MHA_OP, _SPLASH_AVAILABLE
+    if _FLASH_OP is not None or _SPLASH_AVAILABLE is False:
         return
     with _OPS_LOCK:
-        if _FLASH_OP is not None:
+        if _FLASH_OP is not None or _SPLASH_AVAILABLE is False:
             return
-        import jax
+        try:
+            import jax
 
-        from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+            from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
-        def flash(q: jax.Array, k: jax.Array, v: jax.Array, scale: float) -> jax.Array:
-            return _flash_attention(q, k, v, scale)
+            def flash(
+                q: jax.Array, k: jax.Array, v: jax.Array, scale: float
+            ) -> jax.Array:
+                return _flash_attention(q, k, v, scale)
 
-        def splash_mha(
-            q: jax.Array, k: jax.Array, v: jax.Array, scale: float, is_causal: bool
-        ) -> jax.Array:
-            return _splash_mha(q, k, v, scale, is_causal)
+            def splash_mha(
+                q: jax.Array, k: jax.Array, v: jax.Array, scale: float, is_causal: bool
+            ) -> jax.Array:
+                return _splash_mha(q, k, v, scale, is_causal)
 
-        def flash_fake(q, k, v, scale):
-            return q.new_empty(q.shape)
+            def flash_fake(q, k, v, scale):
+                return q.new_empty(q.shape)
 
-        def splash_mha_fake(q, k, v, scale, is_causal):
-            return q.new_empty(q.shape)
+            def splash_mha_fake(q, k, v, scale, is_causal):
+                return q.new_empty(q.shape)
 
-        splash_mha_op = cpu_export_jax_op(
-            "sglang_tpu_pallas::diffusion_splash_mha", splash_mha
-        )
-        splash_mha_op.register_fake(splash_mha_fake)
-        flash_op = cpu_export_jax_op(
-            "sglang_tpu_pallas::diffusion_flash_attention", flash
-        )
-        flash_op.register_fake(flash_fake)
-        _add_kernel_source_to_compile_cache_key()
+            splash_mha_op = cpu_export_jax_op(
+                "sglang_tpu_pallas::diffusion_splash_mha", splash_mha
+            )
+            splash_mha_op.register_fake(splash_mha_fake)
+            flash_op = cpu_export_jax_op(
+                "sglang_tpu_pallas::diffusion_flash_attention", flash
+            )
+            flash_op.register_fake(flash_fake)
+            _add_kernel_source_to_compile_cache_key()
+        except Exception as exc:
+            logger.warning(
+                "TPU Pallas splash attention ops failed to register (%s); using SDPA.",
+                exc,
+            )
+            _SPLASH_AVAILABLE = False
+            return
         _SPLASH_MHA_OP = splash_mha_op
         _FLASH_OP = flash_op
 
@@ -426,6 +482,9 @@ def _sdpa_fallback_reason(
         return f"head_dim={query.shape[-1]}/{value.shape[-1]}"
     if query.shape[1] % key.shape[1] != 0:
         return f"heads={query.shape[1]}/{key.shape[1]}"
+    # SDPA reports a malformed value tensor with a clear shape error.
+    if value.shape[:3] != key.shape[:3]:
+        return f"value shape={tuple(value.shape)} key shape={tuple(key.shape)}"
     # The kernels compute in bf16.
     if not query.dtype == key.dtype == value.dtype == torch.bfloat16:
         return f"dtype={query.dtype}/{key.dtype}/{value.dtype}"
@@ -443,16 +502,30 @@ def tpu_attention(
 ) -> torch.Tensor:
     """``[B, H, S, D]`` attention on TPU through the Pallas kernels, else SDPA.
 
-    Ragged causal attention (``q_seq != kv_seq``) uses SDPA's top-left causal
-    mask, as ``F.scaled_dot_product_attention`` does.
+    Ragged causal attention (``q_seq != kv_seq``) is rejected: SDPA's
+    top-left causal mask differs from ``SDPAImpl``'s bottom-right one, so
+    callers pick the semantics (``TpuSplashAttentionImpl`` routes it to
+    ``SDPAImpl``).
     """
     if scale is None:
         scale = query.shape[-1] ** -0.5
+    # The kernels take the row max of the raw scores, which is the max of the
+    # scaled scores only for a positive scale.
+    if scale <= 0:
+        raise ValueError(f"tpu_attention needs a positive scale, got {scale}")
     q_seq, kv_seq = query.shape[2], key.shape[2]
+    if is_causal and q_seq != kv_seq:
+        raise NotImplementedError(
+            f"tpu_attention: ragged causal attention (q_seq={q_seq}, "
+            f"kv_seq={kv_seq}) is ambiguous; use SDPAImpl's bottom-right mask."
+        )
 
     reason = _sdpa_fallback_reason(query, key, value, is_causal)
     if reason is None:
         _register_ops()
+        if _FLASH_OP is None:
+            reason = "pallas registration failed"
+    if reason is None:
         q, k, v = query.contiguous(), key.contiguous(), value.contiguous()
         if _use_custom_kernel(q_seq, kv_seq, is_causal):
             return _FLASH_OP(q, k, v, scale)
@@ -522,6 +595,8 @@ class TpuSplashAttentionImpl(SDPAImpl):
         self.use_splash = self.dropout == 0.0 and _check_splash_available()
         if self.use_splash:
             _register_ops()
+            self.use_splash = _FLASH_OP is not None
+        _log_resolved_mode_once(self.use_splash, self.dropout)
         # forward_varlen keeps packed segments on plain SDPA.
         self._sdpa = SDPAImpl(
             num_heads=num_heads,
@@ -568,8 +643,9 @@ class TpuSplashAttentionImpl(SDPAImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        # Packed segment lengths vary per request; a Pallas kernel per length
-        # would recompile, so segments stay on SDPA.
+        # Packed segment lengths vary per request. Each new length compiles
+        # under either backend (dynamic=False); SDPA skips the Pallas trace,
+        # export and Mosaic compile on top of that, so segments stay on SDPA.
         return self._sdpa.forward_varlen(
             query,
             key,

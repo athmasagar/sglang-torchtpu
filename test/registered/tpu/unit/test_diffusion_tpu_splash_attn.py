@@ -208,6 +208,11 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
     def test_custom_negative_scores(self):
         self._check(1, 2, 4128, 4128, expect="flash", negative_scores=True)
 
+    def test_custom_largest_block_q(self):
+        # q = kv >= 12800 picks block_q=6400, the top of the VMEM model; the
+        # second query block starts at row 6400.
+        self._check(1, 1, 12800, 12800, expect="flash")
+
     # Text cross-attention on the custom kernel: long query, short KV.
     def test_cross_attention_aligned_kv(self):
         self._check(1, 4, 4096, 512, expect="flash")
@@ -223,6 +228,11 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
     def test_cross_attention_long_query(self):
         # Short KV leaves VMEM for the largest query block.
         self._check(1, 2, 37800, 512, expect="flash")
+
+    def test_cross_attention_capped_block_q_wide_kv(self):
+        # 18944 = 2 x 9472 rows at block_kv=1280: block_q at the cap, the
+        # tightest VMEM point of the short-KV regime.
+        self._check(1, 2, 18944, 1280, expect="flash")
 
     # make_splash_mha, long query against fewer than 512 aligned keys.
     def test_splash_mha_cross_attention(self):
@@ -245,12 +255,20 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         # q_seq < 256 with kv > 512: make_splash_mha with segment-id masking.
         self._check(1, 2, 200, 4128, expect="splash", negative_scores=True)
 
+    def test_short_query_medium_padded_kv(self):
+        # q_seq < 256 with 512 < kv <= 1024: 700 keys pad to 768, masked.
+        self._check(1, 2, 200, 700, expect="splash", negative_scores=True)
+
     def test_long_query_unaligned_kv(self):
         # 1024 < kv < 2048, not 128-aligned: a ragged last KV block.
         self._check(1, 2, 4096, 1500, expect="flash", negative_scores=True)
 
     def test_causal_padded(self):
         self._check(1, 2, 1000, 1000, expect="splash", is_causal=True)
+
+    def test_splash_high_logit_gain(self):
+        # make_splash_mha pre-scales q in bf16; peaked softmaxes amplify that.
+        self._check(1, 2, 1000, 1000, expect="splash", is_causal=True, q_gain=8.0)
 
     # Short or unaligned-short KV stays on SDPA.
     def test_short_sequences(self):
@@ -350,6 +368,26 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
                 got = got.reshape(1, q_seq, 4, 128).transpose(1, 2)
                 self._assert_accurate(got, q, k, v, 128**-0.5, False)
 
+    def test_registration_failure_falls_back_to_sdpa(self):
+        from sglang_tpu import pallas_jax_op
+        from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
+
+        with (
+            patch.object(tsa, "_FLASH_OP", None),
+            patch.object(tsa, "_SPLASH_MHA_OP", None),
+            patch.object(tsa, "_SPLASH_AVAILABLE", True),
+            patch.object(
+                pallas_jax_op, "cpu_export_jax_op", side_effect=RuntimeError("boom")
+            ),
+        ):
+            tsa._register_ops()
+            self.assertFalse(tsa._SPLASH_AVAILABLE)
+            self.assertIsNone(tsa._FLASH_OP)
+            impl = tsa.TpuSplashAttentionImpl(
+                num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5
+            )
+            self.assertFalse(impl.use_splash)
+
     def test_float32_falls_back_to_sdpa(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
             tpu_attention,
@@ -363,7 +401,50 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
 
 
 class TestTpuSplashDispatch(CustomTestCase):
-    """Kernel selection logic; runs without a TPU."""
+    """Kernel selection logic: pure Python over shapes, no kernel runs.
+
+    Lives in the TPU lane because importing sglang_tpu needs the TPU stack.
+    """
+
+    def test_autotune_block_sizes_fit_the_vmem_budget(self):
+        from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
+
+        budget = int(tsa._V7X_VMEM_CAPACITY_BYTES * tsa._VMEM_BUDGET_FRACTION)
+        for q_seq, kv_seq in [
+            (880, 3520),
+            (4128, 4128),
+            (8191, 8191),
+            (12800, 12800),
+            (75600, 75600),
+        ]:
+            block_q, block_kv, block_kv_compute = tsa._autotune_block_sizes(
+                q_seq, kv_seq
+            )
+            self.assertLessEqual(
+                tsa._score_tile_bytes(block_q, block_kv_compute, 128, block_kv),
+                budget,
+                (q_seq, kv_seq),
+            )
+        # Pinned choices: a change here changes the compiled kernels.
+        self.assertEqual(tsa._autotune_block_sizes(880, 3520), (512, 2048, 2048))
+        self.assertEqual(tsa._autotune_block_sizes(4128, 4128), (2304, 2048, 2048))
+        self.assertEqual(tsa._autotune_block_sizes(8191, 8191), (4096, 2048, 2048))
+        self.assertEqual(tsa._autotune_block_sizes(12800, 12800), (6400, 2048, 2048))
+        self.assertEqual(tsa._autotune_block_sizes(75600, 75600), (6400, 2048, 2048))
+        # The budget scales with the capacity it is given.
+        self.assertLess(
+            tsa._autotune_block_sizes(75600, 75600, 128, 32 * 2**20)[0], 6400
+        )
+
+    def test_rejects_non_positive_scale_and_ragged_causal(self):
+        from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
+
+        q = torch.empty((1, 2, 4096, 128), dtype=torch.bfloat16, device="meta")
+        k = torch.empty((1, 2, 2048, 128), dtype=torch.bfloat16, device="meta")
+        with self.assertRaisesRegex(ValueError, "positive scale"):
+            tsa.tpu_attention(q, q, q, scale=-0.1)
+        with self.assertRaisesRegex(NotImplementedError, "ragged causal"):
+            tsa.tpu_attention(q, k, k, is_causal=True)
 
     def test_custom_kernel_selection(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
@@ -376,26 +457,33 @@ class TestTpuSplashDispatch(CustomTestCase):
         self.assertFalse(_use_custom_kernel(75600, 256, False))
         self.assertFalse(_use_custom_kernel(200, 4128, False))
         self.assertFalse(_use_custom_kernel(4096, 4096, True))
+        # The edges of the custom-kernel regime.
+        self.assertFalse(_use_custom_kernel(4096, 511, False))
+        self.assertTrue(_use_custom_kernel(4096, 512, False))
+        self.assertFalse(_use_custom_kernel(255, 4128, False))
+        self.assertTrue(_use_custom_kernel(256, 4128, False))
 
     def test_cross_attn_block_kv_divides_kv(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
             _cross_attn_block_kv,
         )
 
-        for kv_seq in range(128, 2048, 128):
+        # The reachable inputs: 128-aligned KV below 512 keys.
+        for kv_seq in (128, 256, 384):
             block_kv = _cross_attn_block_kv(kv_seq)
             self.assertEqual(kv_seq % block_kv, 0)
-            self.assertLessEqual(block_kv, 1024)
+            self.assertLessEqual(block_kv, 256)
 
     def test_short_kv_query_blocks_are_capped(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
-            autotune_block_sizes,
+            _autotune_block_sizes,
         )
 
         for q_seq, kv_seq in ((75600, 512), (37800, 512), (55800, 1024)):
-            self.assertLessEqual(autotune_block_sizes(q_seq, kv_seq)[0], 9472)
+            self.assertLessEqual(_autotune_block_sizes(q_seq, kv_seq)[0], 9472)
         # Long KV: the VMEM model binds first.
-        self.assertEqual(autotune_block_sizes(75600, 75600), (6400, 2048, 2048))
+        self.assertEqual(_autotune_block_sizes(75600, 75600), (6400, 2048, 2048))
+        self.assertEqual(_autotune_block_sizes(18944, 1280)[0], 9472)
 
     def test_splash_mha_blocks(self):
         from sglang_tpu.multimodal_gen.tpu_splash_attn import (
@@ -437,6 +525,8 @@ class TestTpuSplashDispatch(CustomTestCase):
             self.assertEqual(reason((1, 4, 300, 128), (1, 4, 77, 128)), "short")
             self.assertEqual(reason((1, 4, 4096, 128), (1, 4, 300, 128)), "short")
             self.assertIsNone(reason((1, 4, 18900, 128), (1, 4, 600, 128)))
+            # q < 256 with 512 < kv <= 1024: make_splash_mha, not SDPA.
+            self.assertIsNone(reason((1, 4, 200, 128), (1, 4, 700, 128)))
             self.assertEqual(
                 reason((1, 4, 1000, 128), (1, 4, 2000, 128), is_causal=True),
                 "ragged causal",
@@ -450,6 +540,13 @@ class TestTpuSplashDispatch(CustomTestCase):
                 "dtype=torch.float32/torch.float32/torch.float32",
             )
             self.assertEqual(reason((1, 4, 0, 128), (1, 4, 4608, 128)), "empty")
+            q = torch.empty((1, 4, 4608, 128), dtype=torch.bfloat16, device="meta")
+            v = torch.empty((1, 4, 4096, 128), dtype=torch.bfloat16, device="meta")
+            self.assertTrue(
+                tpu_splash_attn._sdpa_fallback_reason(q, q, v, False).startswith(
+                    "value shape"
+                )
+            )
         with patch.object(
             tpu_splash_attn, "_check_splash_available", return_value=False
         ):

@@ -89,7 +89,7 @@ class TestTpuPlatformSurface(unittest.TestCase):
                 TpuPlatform.get_attn_backend_cls_str(selected, 128, torch.bfloat16),
             )
 
-    def test_attn_backend_splash_is_opt_in(self):
+    def test_attn_backend_splash_class_path(self):
         self.assertIn(
             "tpu_splash_attn.TpuSplashAttentionBackend",
             TpuPlatform.get_attn_backend_cls_str(
