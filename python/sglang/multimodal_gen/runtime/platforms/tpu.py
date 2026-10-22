@@ -202,8 +202,20 @@ class TpuPlatform(Platform):
 
     def apply_server_args_defaults(self, server_args) -> None:
         # The compile warmup layerwise-offloads the DiT, which TPU cannot run.
-        if not server_args.is_arg_explicitly_set("offload_during_compile"):
-            server_args.offload_during_compile = False
+        if (
+            server_args.is_arg_explicitly_set("offload_during_compile")
+            and server_args.offload_during_compile
+        ):
+            logger.warning(
+                "--offload-during-compile is not supported on TPU (the compile "
+                "warmup cannot layerwise-offload the DiT); disabling it."
+            )
+        server_args.offload_during_compile = False
+
+    def supports_teacache_with_torch_compile(self) -> bool:
+        # Every TeaCache state update is a full XLA recompile under the
+        # torch_tpu backend, up to the recompile limit.
+        return False
 
     @classmethod
     def get_attn_backend_cls_str(

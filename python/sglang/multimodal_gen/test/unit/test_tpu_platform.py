@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -200,7 +201,32 @@ class TestTpuPlatformSurface(unittest.TestCase):
                 return ServerArgs.from_kwargs(model_path="/fake", **kwargs)
 
         self.assertFalse(server_args().offload_during_compile)
-        self.assertTrue(server_args(offload_during_compile=True).offload_during_compile)
+        # An explicit request is overridden: the warmup offload crashes on TPU.
+        self.assertFalse(
+            server_args(offload_during_compile=True).offload_during_compile
+        )
+
+    def test_teacache_is_dropped_under_torch_compile(self):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        self.assertFalse(TpuPlatform().supports_teacache_with_torch_compile())
+        for compile_on, expected in ((True, False), (False, True)):
+            with (
+                self.subTest(enable_torch_compile=compile_on),
+                patch.object(
+                    current_platform,
+                    "supports_teacache_with_torch_compile",
+                    TpuPlatform().supports_teacache_with_torch_compile,
+                ),
+            ):
+                params = SamplingParams(enable_teacache=True)
+                params._drop_teacache_if_it_recompiles(
+                    SimpleNamespace(enable_torch_compile=compile_on)
+                )
+                self.assertEqual(params.enable_teacache, expected)
 
 
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")

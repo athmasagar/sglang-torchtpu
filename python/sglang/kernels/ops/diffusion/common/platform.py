@@ -121,4 +121,13 @@ def select_impl(triton_impl: F, **fallbacks: F) -> F:
     """
     impl = fallbacks.get(platform_key(), triton_impl)
     # Resolve now: an import inside a torch.compile'd forward breaks the graph.
-    return impl.resolve() if isinstance(impl, _LazyFallback) else impl
+    if isinstance(impl, _LazyFallback):
+        return impl.resolve()
+    # debug_kernel_api(lazy_fallback(...)): wrap the resolved function instead,
+    # so the wrapper does not import on every call.
+    inner = getattr(impl, "__wrapped__", None)
+    if isinstance(inner, _LazyFallback):
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
+
+        return debug_kernel_api(inner.resolve())
+    return impl

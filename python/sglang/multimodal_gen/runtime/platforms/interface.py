@@ -145,6 +145,15 @@ class Platform:
         """Apply defaults before argument normalization and validation."""
         pass
 
+    def supports_teacache_with_torch_compile(self) -> bool:
+        """Whether TeaCache may run under --enable-torch-compile.
+
+        TeaCache updates module state every denoising step; a backend that
+        recompiles on that (rather than graph-breaking cheaply) says False and
+        requests drop TeaCache with a warning.
+        """
+        return True
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the backend used to compile diffusion modules."""
         return self.simple_compile_backend

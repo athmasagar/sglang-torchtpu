@@ -49,6 +49,8 @@ def apply_rotary_embedding_native(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:
     """Native fallback for rotary embedding (shared with NPU implementation)."""
+    # Mirrors apply_rotary_embedding_native exactly. A full-width interleaved
+    # table is pair-duplicated, so this slice and the repeat below round-trip.
     if interleaved and cos.shape[-1] == x.shape[-1]:
         cos = cos[..., ::2]
         sin = sin[..., ::2]
@@ -93,7 +95,8 @@ def apply_rotary_embedding_pair_swap(
     output of ``x @ R`` is a single +-1 product accumulated in float32, so it is
     exact and the result matches the strided form bit for bit on finite inputs.
     TPU float16 and float32 matmuls are not exact; other dtypes keep the
-    strided form.
+    strided form. A non-finite input spreads NaN (0 * inf) across its whole
+    head through ``x @ R``, where the strided form touches only its pair.
     """
     if x.dtype != torch.bfloat16:
         return apply_rotary_embedding_native(x, cos, sin, interleaved)

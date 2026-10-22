@@ -50,6 +50,46 @@ class TestRopePairSwapTpu(unittest.TestCase):
                         actual.cpu(), expected.cpu(), rtol=0, atol=0
                     )
 
+    def test_bf16_compiled_matches_compiled_strided_form(self):
+        # XLA may fuse the two forms differently under torch.compile.
+        import torch_tpu._internal.compile  # noqa: F401
+
+        from sglang.kernels.ops.diffusion.common.fallback_torch import (
+            _build_pair_swap_matrix,
+        )
+
+        torch.manual_seed(0)
+        head_dim = 128
+        x = torch.randn(33, 4, head_dim).bfloat16().to("tpu")
+        angles = torch.randn(33, head_dim // 2)
+        cos, sin = angles.cos().to("tpu"), angles.sin().to("tpu")
+
+        # x @ R is a signed permutation: exact in bf16.
+        swap = torch.compile(
+            lambda x: torch.matmul(
+                x, _build_pair_swap_matrix(head_dim, x.dtype, x.device)
+            ),
+            backend="tpu",
+            dynamic=False,
+        )
+        x_cpu = x.cpu()
+        expected_swap = torch.stack((-x_cpu[..., 1::2], x_cpu[..., ::2]), dim=-1)
+        torch.testing.assert_close(
+            swap(x).cpu(), expected_swap.flatten(-2), rtol=0, atol=0
+        )
+
+        pair_swap = torch.compile(
+            apply_rotary_embedding_pair_swap, backend="tpu", dynamic=False
+        )
+        native = torch.compile(
+            apply_rotary_embedding_native, backend="tpu", dynamic=False
+        )
+        actual = pair_swap(x, cos, sin, False).cpu().float()
+        expected = native(x, cos, sin, False).cpu().float()
+        # Within one bf16 ulp of the compiled strided form.
+        ulp = expected.abs().clamp_min(2**-126) * 2**-7
+        self.assertTrue(bool(((actual - expected).abs() <= ulp).all()))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -190,6 +190,18 @@ class TestWanStepCounter(unittest.TestCase):
         self.assertEqual(model.cnt, 0)
         self.assertEqual(len(graphs), graphs_after_first_step)
 
+        # A second request with the same parameters reuses the graph: dynamo
+        # does not guard on the identity of the per-request Req.
+        other_req = Req(sampling_params=SamplingParams(enable_teacache=False))
+        with (
+            torch.no_grad(),
+            set_forward_context(
+                current_timestep=0, attn_metadata=None, forward_batch=other_req
+            ),
+        ):
+            compiled(hidden_states, encoder_hidden_states, torch.tensor([999]))
+        self.assertEqual(len(graphs), graphs_after_first_step)
+
     def test_lingbot_world_counts_steps_only_for_teacache(self):
         from sglang.multimodal_gen.configs.models.dits.lingbot_world import (
             LingBotWorldArchConfig,
