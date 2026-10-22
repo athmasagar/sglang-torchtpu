@@ -434,48 +434,58 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                     torch.testing.assert_close(actual, expected)
 
     def test_wan_decoder_shards_height_without_p2p(self):
-        def build(use_parallel_decode):
-            return WanDecoder3d(
-                dim=8,
-                z_dim=4,
-                dim_mult=(1, 2, 2),
-                num_res_blocks=1,
-                attn_scales=(),
-                temperal_upsample=(True, False),
-                out_channels=3,
-                use_parallel_decode=use_parallel_decode,
-            ).eval()
+        # is_residual: the Wan2.2 (TI2V-5B) VAE's residual up blocks.
+        for is_residual in (False, True):
 
-        torch.manual_seed(0)
-        world_size = 3
-        reference = build(False)
-        z = torch.randn(1, 4, 3, 10, 6)
-        with torch.no_grad():
-            expected = _decode_wan_latents(reference, z)
+            def build(use_parallel_decode, is_residual=is_residual):
+                return WanDecoder3d(
+                    dim=8,
+                    z_dim=4,
+                    dim_mult=(1, 2, 2),
+                    num_res_blocks=1,
+                    attn_scales=(),
+                    temperal_upsample=(True, False),
+                    out_channels=3,
+                    is_residual=is_residual,
+                    use_parallel_decode=use_parallel_decode,
+                ).eval()
 
-        with (
-            _collectives_only_decode_group(world_size) as group,
-            patch.object(wanvae.dist, "is_initialized", return_value=True),
-            patch.object(wanvae, "get_decode_parallel_world_size", lambda: world_size),
-            patch.object(
-                wanvae, "get_decode_parallel_rank", lambda: _thread_rank.value
-            ),
-        ):
-            decoders = []
-            for rank in range(world_size):
-                _thread_rank.value = rank
-                decoder = build(True)
-                decoder.load_state_dict(reference.state_dict())
-                decoders.append(decoder)
-            with torch.no_grad():
-                outputs = _run_on_thread_ranks(
-                    group, lambda r: _decode_wan_latents(decoders[r], z)
-                )
+            with self.subTest(is_residual=is_residual):
+                torch.manual_seed(0)
+                world_size = 3
+                reference = build(False)
+                z = torch.randn(1, 4, 3, 10, 6)
+                with torch.no_grad():
+                    expected = _decode_wan_latents(reference, z)
 
-        for output in outputs:
-            torch.testing.assert_close(output, expected)
+                with (
+                    _collectives_only_decode_group(world_size) as group,
+                    patch.object(wanvae.dist, "is_initialized", return_value=True),
+                    patch.object(
+                        wanvae, "get_decode_parallel_world_size", lambda: world_size
+                    ),
+                    patch.object(
+                        wanvae, "get_decode_parallel_rank", lambda: _thread_rank.value
+                    ),
+                ):
+                    decoders = []
+                    for rank in range(world_size):
+                        _thread_rank.value = rank
+                        decoder = build(True)
+                        decoder.load_state_dict(reference.state_dict())
+                        decoders.append(decoder)
+                    with torch.no_grad():
+                        outputs = _run_on_thread_ranks(
+                            group, lambda r: _decode_wan_latents(decoders[r], z)
+                        )
 
-    def test_wan_encoder_shards_height_without_p2p(self):
+                for output in outputs:
+                    torch.testing.assert_close(output, expected)
+
+    def _encode_on_thread_ranks(self, is_residual, x, world_size=3):
+        """The unsharded Wan encoder's output, and each thread rank's when the
+        encoder shards over a collectives-only decode group."""
+
         def build(use_parallel_encode):
             return WanEncoder3d(
                 dim=8,
@@ -483,14 +493,12 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 dim_mult=(1, 2, 2),
                 num_res_blocks=1,
                 temperal_downsample=(True, False),
+                is_residual=is_residual,
                 use_parallel_encode=use_parallel_encode,
             ).eval()
 
         torch.manual_seed(0)
-        world_size = 3
         reference = build(False)
-        # 10 blocks of 4 rows split 4/3/3, so the shards are uneven.
-        x = torch.randn(1, 3, 5, 40, 8)
         with torch.no_grad():
             expected = _encode_wan_video(reference, x)
 
@@ -513,9 +521,37 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 outputs = _run_on_thread_ranks(
                     group, lambda r: _encode_wan_video(encoders[r], x)
                 )
+        return expected, outputs
 
-        for output in outputs:
-            torch.testing.assert_close(output, expected)
+    def test_wan_encoder_shards_height_without_p2p(self):
+        # is_residual: the Wan2.2 (TI2V-5B) VAE's residual down blocks.
+        for is_residual in (False, True):
+            with self.subTest(is_residual=is_residual):
+                # 10 blocks of 4 rows split 4/3/3, so the shards are uneven.
+                # 9 frames encode in chunks of 1, 4 and 4: the last resumes
+                # the height-sharded conv caches, the strided temporal
+                # downsample's included.
+                x = torch.randn(
+                    1, 3, 9, 40, 8, generator=torch.Generator().manual_seed(1)
+                )
+                expected, outputs = self._encode_on_thread_ranks(is_residual, x)
+                for output in outputs:
+                    torch.testing.assert_close(output, expected)
+
+    def test_wan_encoder_encodes_unsplit_heights_unsharded(self):
+        # A height that is not whole downsampling blocks (38 rows, blocks of
+        # 4), or fewer blocks than ranks (8 rows on 3 ranks), stays unsplit:
+        # every rank encodes the whole input. The residual blocks need an
+        # even height at every level, so they take the second case.
+        for is_residual, height in ((False, 38), (True, 8)):
+            with self.subTest(is_residual=is_residual, height=height):
+                x = torch.randn(
+                    1, 3, 9, height, 8, generator=torch.Generator().manual_seed(2)
+                )
+                self.assertIsNone(split_for_parallel_encode(x, 2, 3, 0))
+                expected, outputs = self._encode_on_thread_ranks(is_residual, x)
+                for output in outputs:
+                    torch.testing.assert_close(output, expected)
 
     def test_wan_encoder_shards_only_under_sequence_parallelism(self):
         def build(sp_world_size, decode_world_size):
