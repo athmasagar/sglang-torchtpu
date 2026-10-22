@@ -11,7 +11,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.multimodal_gen.runtime.platforms import tpu_platform_plugin
-from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import (
+    AttentionBackendEnum,
+    Platform,
+)
 from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
 
 _HAS_TORCH_TPU = hasattr(torch, "tpu")
@@ -82,6 +85,10 @@ class TestTpuPlatformSurface(unittest.TestCase):
 
     def test_inference_mode_is_no_grad(self):
         self.assertIsInstance(TpuPlatform.inference_mode(), torch.no_grad)
+
+    def test_only_tpu_exchanges_attention_output_in_head_slabs(self):
+        self.assertTrue(TpuPlatform.prefers_head_slab_output_exchange())
+        self.assertFalse(Platform.prefers_head_slab_output_exchange())
 
     def test_attn_backend_default_is_sdpa(self):
         for selected in (None, AttentionBackendEnum.TORCH_SDPA):

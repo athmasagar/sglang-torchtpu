@@ -7,6 +7,7 @@ these CPU tests do not establish TPU lowering or full-model support.
 """
 
 import importlib.util
+import itertools
 import math
 import os
 import subprocess
@@ -101,9 +102,10 @@ def _gloo_worker(rank, world, init_method):
 
 def _check_head_dim2_output_exchange(usp, rank, world):
     """Heads-major output (an attention kernel's [b, h, s, d] result viewed as
-    [b, s, h, d], more than one local head) is exchanged in head slabs on every
-    platform; any other layout takes the sequence-major relayout. Both return
-    bit-identical values in a fresh contiguous tensor."""
+    [b, s, h, d], more than one local head) is exchanged in head slabs where
+    the platform prefers it (TPU); any other layout or platform takes the
+    sequence-major relayout. Both return bit-identical values in a fresh
+    contiguous tensor."""
     exchange = usp._usp_all_to_all_single
     exchanged_ndims = []
 
@@ -123,34 +125,41 @@ def _check_head_dim2_output_exchange(usp, rank, world):
     usp._usp_all_to_all_single = recording_exchange
     usp._a2a_staging_buffer = reused_staging_buffer
     prefix, local_seq, dim = 2, 3, 5
-    for batch in (1, 2):
-        for local_heads in (1, 2):
-            shape = (batch, prefix + local_seq * world, local_heads * world, dim)
-            full = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape)
-            start = prefix + rank * local_seq
-            local = full[:, start : start + local_seq]
-            heads = full[:, :, rank * local_heads : (rank + 1) * local_heads]
-            heads_major = heads.transpose(1, 2).contiguous().transpose(1, 2)
-            cases = {
-                "sequence-major": (heads[:, prefix:].contiguous(), False),
-                "heads-major": (
-                    heads[:, prefix:].transpose(1, 2).contiguous().transpose(1, 2),
-                    local_heads > 1,
-                ),
-                # A replicated prefix sliced off a heads-major result, as in
-                # USPAttention._forward_with_replicated_prefix.
-                "prefix-sliced heads-major": (heads_major[:, prefix:], False),
-            }
-            for name, (x, head_slabs) in cases.items():
-                case = f"{name}, batch={batch}, local_heads={local_heads}"
-                exchanged_ndims.clear()
-                out = usp._usp_output_all_to_all(x, head_dim=2)
-                assert exchanged_ndims == [5 if head_slabs else 4], case
-                torch.testing.assert_close(out, local, rtol=0, atol=0, msg=case)
-                assert out.is_contiguous(), case
-                kept = out.clone()
-                usp._usp_output_all_to_all(x + 1, head_dim=2)
-                torch.testing.assert_close(out, kept, rtol=0, atol=0, msg=case)
+    for slabs_preferred, batch, local_heads in itertools.product(
+        (False, True), (1, 2), (1, 2)
+    ):
+        usp.current_platform = SimpleNamespace(
+            prefers_head_slab_output_exchange=lambda value=slabs_preferred: value
+        )
+        shape = (batch, prefix + local_seq * world, local_heads * world, dim)
+        full = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape)
+        start = prefix + rank * local_seq
+        local = full[:, start : start + local_seq]
+        heads = full[:, :, rank * local_heads : (rank + 1) * local_heads]
+        heads_major = heads.transpose(1, 2).contiguous().transpose(1, 2)
+        cases = {
+            "sequence-major": (heads[:, prefix:].contiguous(), False),
+            "heads-major": (
+                heads[:, prefix:].transpose(1, 2).contiguous().transpose(1, 2),
+                slabs_preferred and local_heads > 1,
+            ),
+            # A replicated prefix sliced off a heads-major result, as in
+            # USPAttention._forward_with_replicated_prefix.
+            "prefix-sliced heads-major": (heads_major[:, prefix:], False),
+        }
+        for name, (x, head_slabs) in cases.items():
+            case = (
+                f"{name}, slabs_preferred={slabs_preferred}, batch={batch}, "
+                f"local_heads={local_heads}"
+            )
+            exchanged_ndims.clear()
+            out = usp._usp_output_all_to_all(x, head_dim=2)
+            assert exchanged_ndims == [5 if head_slabs else 4], case
+            torch.testing.assert_close(out, local, rtol=0, atol=0, msg=case)
+            assert out.is_contiguous(), case
+            kept = out.clone()
+            usp._usp_output_all_to_all(x + 1, head_dim=2)
+            torch.testing.assert_close(out, kept, rtol=0, atol=0, msg=case)
 
 
 class TestUspPortableLayouts(unittest.TestCase):

@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
@@ -604,14 +605,19 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     s_local, h_global = s_global // world_size, h_local * world_size
 
-    if head_dim == 2 and h_local > 1 and x.transpose(1, 2).is_contiguous():
+    if (
+        head_dim == 2
+        and h_local > 1
+        and current_platform.prefers_head_slab_output_exchange()
+        and x.transpose(1, 2).is_contiguous()
+    ):
         # Heads-major input ([b, h_local, s, d] viewed as [b, s, h_local, d]), on
-        # every platform: exchange whole [s_local, d] head slabs and relayout
-        # once after the exchange, merged with the head gather, instead of
-        # relayouting to sequence-major before it. Values are bit-identical to
-        # the path below. On TPU the slab rows stay dense, so (8, 128) tiles do
-        # not pad h_local. h_local > 1: with one head, sequence-major inputs
-        # also pass the contiguity check.
+        # platforms that ask for it (TPU): exchange whole [s_local, d] head
+        # slabs and relayout once after the exchange, merged with the head
+        # gather, instead of relayouting to sequence-major before it. Values are
+        # bit-identical to the path below. On TPU the slab rows stay dense, so
+        # (8, 128) tiles do not pad h_local. h_local > 1: with one head,
+        # sequence-major inputs also pass the contiguity check.
         x = (
             x.transpose(1, 2)
             .reshape(b, h_local, world_size, s_local, d)

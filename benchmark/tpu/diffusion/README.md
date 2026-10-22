@@ -2,8 +2,8 @@
 
 Launch recipes for `sglang.multimodal_gen` on one tpu7x 2x2x1 host (8 TensorCores, `--num-gpus` counts cores).
 All recipes use the Pallas splash attention backend, torch.compile with the `tpu` backend, a TP-folded resident
-text encoder, the highest TPU clock and a 128 MiB scoped-VMEM limit for XLA fusions (`LIBTPU_INIT_ARGS`); see
-`launch.sh`.
+text encoder, the highest TPU clock and a 65536 KiB scoped-VMEM limit for XLA fusions (`LIBTPU_INIT_ARGS`), the full
+64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than without it); see `launch.sh`.
 
 | Recipe | Model | Cores | Parallelism |
 | :--- | :--- | :---: | :--- |

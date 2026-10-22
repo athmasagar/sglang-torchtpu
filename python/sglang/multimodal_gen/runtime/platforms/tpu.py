@@ -63,9 +63,9 @@ def _expand_query_broadcast_mask(query, attn_mask):
     """Expand a mask's size-1 query dim to the query length on TPU.
 
     torch_tpu SDPA returns NaN for masks that broadcast over queries, e.g.
-    [B, 1, 1, S] key padding (0.1.1.dev20260924 and
-    0.1.1+release.2026.9.22; 0.1.1.dev20260817 is correct). Remove once
-    test_diffusion_tpu_sdpa_mask's canary stops reproducing it.
+    [B, 1, 1, S] key padding; reproduced on torch_tpu 0.2.0rc4 (libtpu
+    0.0.50). Remove once test_diffusion_tpu_sdpa_mask's canary stops
+    reproducing it.
     """
     if (
         attn_mask is not None
@@ -193,6 +193,12 @@ class TpuPlatform(Platform):
     def supports_safetensors_device_load(cls) -> bool:
         # safetensors rejects 'tpu:N'.
         return False
+
+    @classmethod
+    def prefers_head_slab_output_exchange(cls) -> bool:
+        # torch_tpu relayouts a sequence-major staging copy around the
+        # collective; dense head slabs keep (8, 128) tiles unpadded.
+        return True
 
     @classmethod
     def inference_mode(cls):
