@@ -408,5 +408,72 @@ class TestTorchTpuIntegration(unittest.TestCase):
             self.assertEqual(torch.tpu.memory_allocated(), 0)
 
 
+class TestFusionBarrier(unittest.TestCase):
+    # CPU-only torch rejects torch.device("tpu"); only .device.type is read.
+    _TPU_TENSOR = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+
+    def test_default_platform_returns_the_input(self):
+        x = torch.arange(4.0)
+        self.assertIs(Platform.fusion_barrier(x), x)
+
+    def test_host_tensors_pass_through(self):
+        x = torch.arange(4.0)
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            self.assertIs(TpuPlatform.fusion_barrier(x), x)
+
+    def test_eager_tpu_tensors_pass_through(self):
+        x = self._TPU_TENSOR
+        self.assertIs(TpuPlatform.fusion_barrier(x), x)
+
+    def test_compiled_tpu_tensors_take_the_torch_tpu_barrier(self):
+        x = self._TPU_TENSOR
+        public = MagicMock(return_value=["public"])
+        raw = MagicMock(return_value=["raw"])
+        for tpu_module, want in (
+            (
+                SimpleNamespace(ops=SimpleNamespace(optimization_barrier=public)),
+                "public",
+            ),
+            (SimpleNamespace(), "raw"),
+        ):
+            with (
+                self.subTest(want=want),
+                patch.object(torch, "tpu", tpu_module, create=True),
+                patch.object(
+                    torch.ops, "tpu", SimpleNamespace(optimization_barrier=raw)
+                ),
+                patch.object(torch.compiler, "is_compiling", return_value=True),
+            ):
+                self.assertEqual(TpuPlatform.fusion_barrier(x), want)
+        public.assert_called_once_with([x])
+        raw.assert_called_once_with([x])
+
+    def test_wan_ffn_runs_the_barrier_between_the_activation_and_fc_out(self):
+        from sglang.multimodal_gen.runtime.models.dits import wanvideo
+
+        calls = []
+
+        def step(name, value):
+            calls.append(name)
+            return value
+
+        mlp = SimpleNamespace(
+            fc_in=lambda x: (step("fc_in", x), None),
+            fc_out=lambda x: (step("fc_out", x), None),
+            _apply_activation=lambda x, bias, use_fused_bias_gelu: step("act", x),
+        )
+        with (
+            patch.object(wanvideo, "fused_gelu_active", return_value=False),
+            patch.object(wanvideo, "nvfp4_bias_gelu_active", return_value=False),
+            patch.object(
+                wanvideo.current_platform,
+                "fusion_barrier",
+                side_effect=lambda x: step("barrier", x),
+            ),
+        ):
+            wanvideo._WanGELUMLP.forward(mlp, torch.ones(2))
+        self.assertEqual(calls, ["fc_in", "act", "barrier", "fc_out"])
+
+
 if __name__ == "__main__":
     unittest.main()

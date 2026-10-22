@@ -158,6 +158,12 @@ class Platform:
         """Return the backend used to compile diffusion modules."""
         return self.simple_compile_backend
 
+    def get_spmd_region_wrapper(self) -> Callable | None:
+        """Decorator for --regional-compile regions that every rank runs with the
+        same graph (the model sets ``_compile_regions_spmd_safe``). The regions
+        should trace as one graph each."""
+        return None
+
     def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
         """Return backend-specific options for a diffusion module."""
         return None
@@ -569,6 +575,15 @@ class Platform:
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Apply platform-specific optimizations to VAE after loading."""
         return vae
+
+    @classmethod
+    def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
+        """Pass ``x`` through a point the graph compiler may not fuse across.
+
+        The values are unchanged; platforms without such a primitive return
+        ``x`` itself.
+        """
+        return x
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)

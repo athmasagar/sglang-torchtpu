@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import os
+from collections.abc import Callable
 
 import torch
 
@@ -208,6 +209,34 @@ class TpuPlatform(Platform):
     def get_device(self, local_rank: int) -> torch.device:
         return self.get_local_torch_device()
 
+    def get_spmd_region_wrapper(self) -> Callable | None:
+        # torch_tpu splits a compiled graph at every collective and re-lays out
+        # tensors at each split. Marking a region SPMD-safe keeps its
+        # collectives in one program. A whole-DiT program needs too much
+        # scratch, so only regions. The ranks must run identical programs: the
+        # fused collectives otherwise hang or exchange the wrong data.
+        import torch.compiler.config as compiler_config
+
+        try:
+            from torch_tpu._internal.distributed.spmd_util import spmd_safe
+        except ImportError:
+            # A private API: without it, regions keep split collectives.
+            logger.warning_once(
+                "torch_tpu has no spmd_safe; regional-compile programs keep "
+                "their collectives split."
+            )
+            return None
+
+        # The region annotation is not part of the compile cache key; keep
+        # persisted executables of the two region policies apart.
+        tag = "spmd-safe-regions-v1"
+        existing_tag = str(compiler_config.cache_key_tag or "")
+        if tag not in existing_tag.split("|"):
+            compiler_config.cache_key_tag = (
+                f"{existing_tag}|{tag}" if existing_tag else tag
+            )
+        return spmd_safe
+
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         if not cls._worker_initialized:
@@ -303,3 +332,14 @@ class TpuPlatform(Platform):
     @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         return False
+
+    @classmethod
+    def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
+        # Only a compiled XLA program fuses; in eager the barrier would copy x.
+        if x.device.type != "tpu" or not torch.compiler.is_compiling():
+            return x
+        barrier = getattr(getattr(torch.tpu, "ops", None), "optimization_barrier", None)
+        if barrier is None:
+            # torch_tpu releases before torch.tpu.ops expose only the raw op.
+            barrier = torch.ops.tpu.optimization_barrier
+        return barrier([x])[0]
