@@ -988,16 +988,29 @@ def allgather_kv_ring_attn(
     zeroed. Which shard is local and how many real keys each shard holds
     depend on the rank, so they reach the kernel as device data: ranks running
     collectives inside one compiled program must compile the same program.
+
+    Nothing rotates: K/V of the whole ring group stay resident on every device
+    (about ``2 * S_total * H_kv * D`` elements), and only the local shard's
+    compute (1/R of the layer) can hide the gathers. Bytes on the wire equal a
+    p2p ring's; this trades memory for not needing p2p, which TPU lacks.
+    Self-attention only: query and key shards have the same length.
     """
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."
     world_size = dist.get_world_size(group=ring_pg)
     batch, shard_len, kv_heads = key.shape[:3]
+    # Query rows are zeroed by key position below.
+    assert query.shape[1] == shard_len, (
+        f"all-gather ring needs equal query/key shards, got {query.shape[1]} "
+        f"and {shard_len}"
+    )
     padded = kv_real_len is not None and kv_real_len < world_size * shard_len
     if kv_real_len is None:
         kv_real_len = world_size * shard_len
     # This rank's ring position as data: an all-to-all of [0, .., R-1] hands
-    # rank r the value r. Issued before the K/V gathers it gates.
+    # rank r the value r. Issued before the K/V gathers it gates. A per-process
+    # constant tensor would skip the collective, but a compiler may fold it
+    # into a rank-specialised program, which breaks one-program-per-rank.
     positions = torch.arange(world_size, dtype=torch.float32, device=key.device)
     rank_t = ft_c.all_to_all_single(positions, None, None, group=ring_pg)
     # Heads-major shards, the kernel's layout: the gathered K/V need no

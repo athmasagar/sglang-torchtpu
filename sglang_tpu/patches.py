@@ -349,10 +349,12 @@ def _register_aten_fallbacks() -> None:
     # use it.
     @torch.library.register_kernel("aten::logaddexp", "PrivateUse1")
     def _logaddexp(self, other):
+        # CPU's formulation: max + log1p(exp(-|a - b|)). Equal inputs (both
+        # -inf or both +inf included) would give inf - inf = NaN, so their gap
+        # is 0 and the result is max + log(2), still -inf or +inf.
         peak = torch.maximum(self, other)
-        # Both -inf: keep the result -inf instead of NaN from inf - inf.
-        peak = torch.where(torch.isinf(peak), torch.zeros_like(peak), peak)
-        return peak + torch.log(torch.exp(self - peak) + torch.exp(other - peak))
+        gap = torch.where(self == other, torch.zeros_like(peak), -(self - other).abs())
+        return peak + torch.log1p(torch.exp(gap))
 
     # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
     # back. Vision towers use it to resize position embeddings per image grid

@@ -1475,6 +1475,12 @@ class USPAttention(nn.Module):
         if get_ring_parallel_world_size() > 1:
             if not self.causal and self.attn_impl.supports_ring_resume():
                 out = allgather_kv_ring_attn(q, k, v, attn_impl=self.attn_impl)
+            elif self.attn_impl.supports_ring_resume():
+                # Backends that ring by all-gather (TPU) lack a causal kernel
+                # path; the templated ring would run an unrolled reference.
+                raise NotImplementedError(
+                    "All-gather ring attention is non-causal only."
+                )
             else:
                 out = ring_attn(
                     q,

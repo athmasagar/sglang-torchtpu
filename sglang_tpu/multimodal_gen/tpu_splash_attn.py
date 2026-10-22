@@ -942,6 +942,11 @@ class TpuSplashAttentionBackend(SDPABackend):
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.TPU_SPLASH_ATTN
 
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        # Ring by K/V all-gather (usp.allgather_kv_ring_attn), not p2p.
+        return True
+
     @staticmethod
     def get_impl_cls() -> type["TpuSplashAttentionImpl"]:
         return TpuSplashAttentionImpl

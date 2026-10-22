@@ -27,6 +27,8 @@ class TestAtenFallbacksTpu(CustomTestCase):
         b = torch.randn(2, 8, 1024, generator=gen) * 30
         a[0, 0, :2] = float("-inf")
         b[0, 0, :4] = float("-inf")
+        a[0, 1, :2] = float("inf")
+        b[0, 1, 1:3] = float("inf")
         got = torch.logaddexp(a.to("tpu"), b.to("tpu")).cpu()
         torch.testing.assert_close(got, torch.logaddexp(a, b), rtol=1e-5, atol=1e-5)
 
