@@ -131,7 +131,8 @@ prepares patches. Live check:
 ## Startup cleanup
 
 The existing `/freeze_gc` request joins pending compilation saves and releases
-startup file-cache pages before collecting garbage, freezing GC and trimming
+startup file-cache pages, clears JAX tracing/compilation caches, then collects
+garbage before freezing GC and trimming
 freed host heap pages. Each host scans its files once; all worker ranks finish
 cleanup before the scheduler acknowledgement and startup readiness message.
 
@@ -149,3 +150,7 @@ eviction happens at final cleanup. This can increase peak host memory relative
 to evicting immediately after weight loading. Reusing these files after cleanup
 can require storage reads. One rank per host logs cgroup headroom and NUMA large
 free blocks after cleanup; these diagnostics do not gate readiness.
+
+JAX cache clearing leaves loaded serving executables alive, but new shapes may
+need retracing. It runs independently of the file-cache and allocator-trim
+opt-outs so GC does not freeze obsolete tracing objects.
