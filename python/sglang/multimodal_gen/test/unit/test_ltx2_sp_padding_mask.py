@@ -63,6 +63,35 @@ class TestLtx2SpPaddingMask(unittest.TestCase):
                     )
                     self.assertIs(batch.sp_audio_padded, padded)
 
+    def test_mixed_padding_masks_only_the_padded_stream(self):
+        cpu = torch.device("cpu")
+        for video_padded in (False, True):
+            audio_padded = not video_padded
+            with self.subTest(video_padded=video_padded):
+                batch = SimpleNamespace(
+                    sp_video_valid_token_count=6 if video_padded else 8,
+                    sp_video_padded=video_padded,
+                    sp_audio_valid_token_count=3 if audio_padded else 4,
+                    sp_audio_padded=audio_padded,
+                )
+                video, audio, a2v, v2a = (
+                    LTX2DenoisingStage._build_ltx2_sp_attention_masks(
+                        batch,
+                        video_seq_len=8,
+                        audio_seq_len=4,
+                        batch_size=2,
+                        video_device=cpu,
+                        audio_device=cpu,
+                    )
+                )
+                padded, unpadded = (video, audio) if video_padded else (audio, video)
+                self.assertIsNone(unpadded)
+                self.assertIsNotNone(padded)
+                self.assertFalse(bool(padded[:, -1].any()))
+                # Cross-attention takes its key stream's mask.
+                self.assertIs(a2v, audio)
+                self.assertIs(v2a, video)
+
     def test_unpadded_sp_shards_skip_the_self_attention_mask(self):
         batch = SimpleNamespace(sp_video_valid_token_count=8, sp_video_padded=False)
         self.assertIsNone(_video_self_attention_mask(batch, seq_len=8, batch_size=2))

@@ -94,8 +94,10 @@ class TestTorchTpuStillNeedsTheMaskPatch(CustomTestCase):
         ).to("cpu")
         self.assertTrue(
             torch.isnan(got.float()).any().item(),
-            "torch_tpu now handles query-broadcast SDPA masks; remove "
-            "_patch_sdpa_query_broadcast_mask",
+            "torch_tpu now handles query-broadcast SDPA masks at this shape: "
+            "check the production shapes (LTX-2 text masks), then remove "
+            "_patch_sdpa_query_broadcast_mask in "
+            "python/sglang/multimodal_gen/runtime/platforms/tpu.py and this test.",
         )
 
 

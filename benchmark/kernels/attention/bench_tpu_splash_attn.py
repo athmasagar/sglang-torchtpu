@@ -97,7 +97,7 @@ def main():
     kv_seq = args.kv_seq or args.seq
     print(
         f"shape: B=1 H={args.heads} Sq={args.seq} Skv={kv_seq} D={head_dim} bf16\n"
-        f"flash kernel blocks: {tsa.autotune_block_sizes(args.seq, kv_seq, head_dim)}"
+        f"flash kernel blocks: {tsa._autotune_block_sizes(args.seq, kv_seq, head_dim)}"
     )
     tsa._register_ops()
 

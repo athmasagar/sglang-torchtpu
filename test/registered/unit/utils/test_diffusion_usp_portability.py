@@ -124,9 +124,11 @@ def _check_head_dim2_output_exchange(usp, rank, world):
 
     usp._usp_all_to_all_single = recording_exchange
     usp._a2a_staging_buffer = reused_staging_buffer
-    prefix, local_seq, dim = 2, 3, 5
-    for slabs_preferred, batch, local_heads in itertools.product(
-        (False, True), (1, 2), (1, 2)
+    prefix, dim = 2, 5
+    # local_seq == batch == 1 is where a contiguous() of the gathered slabs
+    # would alias the reused staging buffer.
+    for slabs_preferred, batch, local_heads, local_seq in itertools.product(
+        (False, True), (1, 2), (1, 2), (1, 3)
     ):
         usp.current_platform = SimpleNamespace(
             prefers_head_slab_output_exchange=lambda value=slabs_preferred: value
@@ -150,7 +152,7 @@ def _check_head_dim2_output_exchange(usp, rank, world):
         for name, (x, head_slabs) in cases.items():
             case = (
                 f"{name}, slabs_preferred={slabs_preferred}, batch={batch}, "
-                f"local_heads={local_heads}"
+                f"local_heads={local_heads}, local_seq={local_seq}"
             )
             exchanged_ndims.clear()
             out = usp._usp_output_all_to_all(x, head_dim=2)
@@ -204,6 +206,7 @@ class TestUspPortableLayouts(unittest.TestCase):
         # torch_tpu relayout copies around the collective.
         usp = _load_usp()
         usp.get_sp_group = lambda: SimpleNamespace(ulysses_group=object())
+        usp.get_ulysses_parallel_world_size = lambda: 2
         seen = []
 
         def all_to_all_single(output, input, group=None):

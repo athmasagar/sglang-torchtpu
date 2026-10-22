@@ -102,6 +102,9 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     # tensor in its own shape moves the same bytes as a flat exchange; a
     # flattened buffer costs torch_tpu relayout copies around the collective.
     x = x.contiguous()
+    assert x.shape[0] % get_ulysses_parallel_world_size() == 0, (
+        f"dim 0 ({x.shape[0]}) must split evenly over the Ulysses group"
+    )
     if role is None:
         output = torch.empty_like(x)
     else:
@@ -613,10 +616,14 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     ):
         # Heads-major input ([b, h_local, s, d] viewed as [b, s, h_local, d]), on
         # platforms that ask for it (TPU): exchange whole [s_local, d] head
-        # slabs and relayout once after the exchange, merged with the head
-        # gather, instead of relayouting to sequence-major before it. Values are
-        # bit-identical to the path below. On TPU the slab rows stay dense, so
-        # (8, 128) tiles do not pad h_local. h_local > 1: with one head,
+        # slabs instead of the sequence-major [s, b, h_local, d] buffer. The
+        # relayout copy before the exchange and the gather copy after it are the
+        # same two copies as the path below; what changes is the exchanged
+        # buffer, whose minor dims (s_local, d) stay dense where (h_local, d)
+        # would be padded to (8, 128) tiles on TPU. Values are bit-identical to
+        # the path below. Callers that slice a replicated prefix/suffix off the
+        # output (FLUX.2, Z-Image) are not heads-major contiguous and take the
+        # path below. h_local > 1: with one head,
         # sequence-major inputs also pass the contiguity check.
         x = (
             x.transpose(1, 2)
