@@ -344,7 +344,9 @@ def _register_aten_fallbacks() -> None:
         self.copy_(out)
         return self
 
-    # aten::logaddexp -- no TPU kernel; the ring-attention LSE merges use it.
+    # aten::logaddexp -- no TPU kernel (torch_tpu 0.2.0rc4, libtpu 0.0.50:
+    # aten::logaddexp.out is not implemented); the ring-attention LSE merges
+    # use it.
     @torch.library.register_kernel("aten::logaddexp", "PrivateUse1")
     def _logaddexp(self, other):
         peak = torch.maximum(self, other)
