@@ -158,7 +158,11 @@ def expand_wan_ti2v_timestep(
     # Each SP rank builds the timesteps of the latents it holds (its time
     # shard, or the whole video when unsharded), so ranks agree on every token.
     if reserved_frames_mask is not None:
-        temp_ts = (reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded).flatten()
+        # One timestep per patch: sample the mask at the patch stride.
+        pt, ph, pw = patch_size
+        temp_ts = (
+            reserved_frames_mask[0][::pt, ::ph, ::pw] * t_device_rounded
+        ).flatten()
         temp_ts = torch.cat(
             [
                 temp_ts,

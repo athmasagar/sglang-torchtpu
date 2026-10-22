@@ -5,6 +5,7 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.models.vaes import base as vae_base
 from sglang.multimodal_gen.runtime.pipelines_core.stages import decoding
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
@@ -249,7 +250,7 @@ class TestDecodeUsesEveryRank(unittest.TestCase):
             return SimpleNamespace(
                 use_parallel_decode=True,
                 parallel_decode_mode=mode,
-                auto_parallel_decode_shards_without_p2p=opted_in,
+                auto_shards_without_p2p=opted_in,
             )
 
         cases = (
@@ -263,7 +264,8 @@ class TestDecodeUsesEveryRank(unittest.TestCase):
             platform = SimpleNamespace(supports_distributed_p2p=lambda p2p=p2p: p2p)
             with (
                 self.subTest(p2p=p2p, mode=stub.parallel_decode_mode),
-                patch.object(decoding, "current_platform", platform),
+                # The policy helper lives with the VAE config policy.
+                patch.object(vae_base, "current_platform", platform),
                 patch.object(
                     decoding, "model_parallel_is_initialized", return_value=True
                 ),
@@ -295,7 +297,7 @@ class TestDecodeUsesEveryRank(unittest.TestCase):
 
         platform = SimpleNamespace(supports_distributed_p2p=lambda: False)
         with (
-            patch.object(decoding, "current_platform", platform),
+            patch.object(vae_base, "current_platform", platform),
             patch.object(decoding, "model_parallel_is_initialized", return_value=True),
             patch.object(decoding, "get_decode_parallel_world_size", return_value=2),
         ):

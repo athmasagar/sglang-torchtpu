@@ -306,7 +306,11 @@ def halo_exchange(
     recv_bottom_buf: torch.Tensor | None = None,
     height_pad_mode: str = "zeros",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """exchange(send and recv) top/bottom conv-input halos with adjacent spatial ranks"""
+    """Exchange top/bottom conv-input halos with adjacent spatial ranks.
+
+    Point-to-point send/recv where the platform has p2p; otherwise one
+    all-gather of every rank's edge rows (``_gather_neighbor_halos``).
+    """
     if spatial_parallel_decode_disabled():
         return x, recv_top_buf, recv_bottom_buf
     if height_halo_size == 0:
@@ -396,9 +400,16 @@ def _gather_neighbor_halos(
 ) -> None:
     """Halo exchange for platforms with collectives only.
 
-    Every rank gathers all edge rows and keeps its neighbors'. The edges are a
-    few rows, so the extra traffic is small next to the convolution.
+    Every rank gathers all edge rows and keeps its neighbors': it receives
+    ``world_size * 2 * h`` rows to use ``2 * h``, so traffic grows linearly
+    with the decode group. Fine up to 8-16 ranks next to the convolution;
+    revisit (e.g. a neighbour collective_permute) for larger groups.
     """
+    logger.info_once(
+        "Spatially sharded VAE conv without p2p: halos travel by all-gather "
+        "over %d ranks.",
+        world_size,
+    )
     height_halo_size = top_row.shape[-2]
     edges = decode_group.all_gather(
         torch.cat([top_row, bottom_row], dim=-2).contiguous(),
@@ -504,7 +515,7 @@ def _spatial_parallel_conv_forward(
     height_pad_mode: str,
     match_conv3d_format: bool = False,
 ) -> torch.Tensor:
-    # send and recv halo
+    # Exchange halos (p2p, or an all-gather without p2p).
     # x_padded: concatenated input
     x_padded, module._halo_recv_top_buf, module._halo_recv_bottom_buf = halo_exchange(
         x,

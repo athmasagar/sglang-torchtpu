@@ -10,7 +10,10 @@ import weakref
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.models.vaes.base import is_auto_parallel_decode_mode
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    auto_mode_may_shard_on_this_platform,
+    is_auto_parallel_decode_mode,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows_kernel_fusions,
 )
@@ -59,12 +62,13 @@ def decode_uses_every_rank(vae) -> bool:
     """
     if vae is None or not vae.use_parallel_decode:
         return False
-    # Without p2p, auto mode shards only VAEs that opt in; the rest decode on
-    # one rank (should_use_spatial_shard_parallel_decode). Read from the VAE:
-    # some replace .config with their arch config.
-    if not current_platform.supports_distributed_p2p() and (
-        is_auto_parallel_decode_mode(vae.parallel_decode_mode)
-        and not getattr(vae, "auto_parallel_decode_shards_without_p2p", False)
+    # The same no-p2p policy as should_use_spatial_shard_parallel_decode.
+    # Read from the VAE: some replace .config with their arch config; a VAE
+    # without the attribute never opted in.
+    if is_auto_parallel_decode_mode(
+        vae.parallel_decode_mode
+    ) and not auto_mode_may_shard_on_this_platform(
+        getattr(vae, "auto_shards_without_p2p", False)
     ):
         return False
     return model_parallel_is_initialized() and get_decode_parallel_world_size() > 1

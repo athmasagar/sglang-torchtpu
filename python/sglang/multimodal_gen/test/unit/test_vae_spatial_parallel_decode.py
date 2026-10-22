@@ -584,6 +584,44 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertEqual(encoder.world_size, 4)
         self.assertIsInstance(encoder.conv_in, SpatialParallelCausalConv3d)
 
+    def test_explicit_spatial_shard_needs_a_latent_row_per_rank(self):
+        from sglang.multimodal_gen.runtime.models.vaes import common
+
+        config = WanVAEConfig()
+        config.parallel_decode_mode = "spatial_shard"
+        with patch.object(common, "_decode_parallel_world_size", lambda: 4):
+            self.assertFalse(
+                common.should_run_spatial_shard_parallel_decode(
+                    config, torch.empty(1, 4, 1, 3, 8)
+                )
+            )
+            self.assertTrue(
+                common.should_run_spatial_shard_parallel_decode(
+                    config, torch.empty(1, 4, 1, 4, 8)
+                )
+            )
+
+    def test_wan_encoder_returns_the_whole_input_when_sharding_is_disabled(self):
+        encoder = WanEncoder3d(
+            dim=8,
+            z_dim=4,
+            dim_mult=(1, 2, 2),
+            num_res_blocks=1,
+            temperal_downsample=(True, False),
+            use_parallel_encode=True,
+        ).eval()
+        # As if built under a 3-rank group; the disabled context must win.
+        encoder.world_size, encoder.rank = 3, 1
+        x = torch.randn(1, 3, 1, 40, 8)
+        with (
+            patch.object(
+                encoder, "_forward", side_effect=lambda t: t.shape[-2]
+            ) as forward,
+            disable_spatial_parallel_decode(),
+        ):
+            self.assertEqual(encoder(x), 40)
+        forward.assert_called_once()
+
     def test_wan_encode_split_keeps_whole_downsampling_blocks(self):
         x = torch.arange(40).view(1, 1, 1, 40, 1)
         shards = [split_for_parallel_encode(x, 3, 3, rank) for rank in range(3)]

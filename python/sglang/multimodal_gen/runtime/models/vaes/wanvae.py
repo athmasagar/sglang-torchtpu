@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     gather_and_trim_height,
     gather_height_for_global_op,
     split_for_parallel_decode,
+    spatial_parallel_decode_disabled,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
@@ -1047,7 +1048,11 @@ class WanEncoder3d(nn.Module):
             self.rank = get_decode_parallel_rank()
 
     def forward(self, x):
-        if not (self.use_parallel_encode and self.world_size > 1):
+        # Inside disable_spatial_parallel_decode() the convs run unsharded, so
+        # a split input would return one rank's shard.
+        if spatial_parallel_decode_disabled() or not (
+            self.use_parallel_encode and self.world_size > 1
+        ):
             return self._forward(x)
         split = split_for_parallel_encode(
             x, self.downsample_count, self.world_size, self.rank

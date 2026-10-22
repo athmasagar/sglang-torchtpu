@@ -401,7 +401,9 @@ def _eager_temb_table_slices(
     # One contiguous (B, S, D) tensor per slice, as the fused kernel writes.
     # Chunk views of the (B, S, 6, D) sum would cross the compiled graph's
     # collective splits, and torch_tpu re-lays such views out in every block.
-    return tuple(table[:, j] + temb[:, :, j].float() for j in range(6))
+    # fp32 (1, D) + bf16 (B, S, D) promotes to fp32 exactly, without a
+    # (B, S, D) fp32 temporary per slice.
+    return tuple(table[:, j] + temb[:, :, j] for j in range(6))
 
 
 def _wan_temb_table_slices(
@@ -1305,6 +1307,11 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             timestep_proj = timestep_proj.unflatten(1, (6, -1))
 
         if sequence_shard_enabled and ts_seq_len is not None:
+            # Per-token timesteps are sized from the unpadded latents.
+            assert timestep_proj.shape[1] == seq_len_orig, (
+                f"per-token timesteps ({timestep_proj.shape[1]}) must match the "
+                f"unpadded sequence ({seq_len_orig})"
+            )
             if seq_shard_pad > 0:
                 pad = torch.zeros(
                     (

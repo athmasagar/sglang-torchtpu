@@ -41,6 +41,15 @@ def _should_use_auto_spatial_shard_parallel_decode(
     return latent_elements_per_rank >= min_latent_elements_per_rank
 
 
+def auto_mode_may_shard_on_this_platform(shards_without_p2p: bool) -> bool:
+    """The no-p2p policy of auto mode, shared by decode and stage planning.
+
+    Without p2p the conv halos travel by all-gather, which pays off only for
+    VAEs that opt in (``auto_parallel_decode_shards_without_p2p``).
+    """
+    return current_platform.supports_distributed_p2p() or shards_without_p2p
+
+
 def should_use_spatial_shard_parallel_decode(
     config: Any, z: torch.Tensor | None = None, world_size: int = 1
 ) -> bool:
@@ -56,10 +65,8 @@ def should_use_spatial_shard_parallel_decode(
     if not config.auto_parallel_decode_prefers_spatial_shard():
         return False
 
-    # Without p2p the conv halos travel by all-gather.
-    if not (
-        current_platform.supports_distributed_p2p()
-        or config.auto_parallel_decode_shards_without_p2p()
+    if not auto_mode_may_shard_on_this_platform(
+        config.auto_parallel_decode_shards_without_p2p()
     ):
         return False
 
