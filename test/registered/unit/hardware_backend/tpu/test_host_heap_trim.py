@@ -20,6 +20,9 @@ class _Scheduler:
     def __init__(self):
         self.calls = []
 
+    def init_all_cuda_graphs(self):
+        self.calls.append("graphs")
+
     def handle_freeze_gc(self, recv_req):
         # Like the core handler: freeze without collecting first.
         self.calls.append(recv_req)
@@ -61,6 +64,7 @@ class TestTrimHostHeap(CustomTestCase):
 class TestInstall(CustomTestCase):
     def setUp(self):
         for name, value in {
+            "start_checkpoint_page_cache_release": lambda: None,
             "release_startup_page_cache": lambda: None,
             "log_startup_memory": lambda: None,
             "_release_cpu_backend": lambda: None,
@@ -157,8 +161,18 @@ class TestInstall(CustomTestCase):
 
     def test_install_wraps_once(self):
         wrapped = self.cls.handle_freeze_gc
+        graphs = self.cls.init_all_cuda_graphs
         tpu.install(scheduler_cls=self.cls)
         self.assertIs(self.cls.handle_freeze_gc, wrapped)
+        self.assertIs(self.cls.init_all_cuda_graphs, graphs)
+        scheduler = self.cls()
+        with patch.object(
+            tpu,
+            "start_checkpoint_page_cache_release",
+            side_effect=lambda: scheduler.calls.append("checkpoint release"),
+        ):
+            scheduler.init_all_cuda_graphs()
+        self.assertEqual(scheduler.calls, ["checkpoint release", "graphs"])
 
     def test_cleanup_finishes_before_the_scheduler_reply(self):
         scheduler = self.cls()

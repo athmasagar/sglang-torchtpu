@@ -10,6 +10,11 @@ runs once right after warmup. The wrapper collects garbage before the
 handler freezes the GC, then releases the free pages. File caches and export
 records are released before collection.
 
+The graph-initialization wrapper starts checkpoint eviction after serial
+weight loading, so it can overlap warmup. The final cleanup joins that work.
+The platform's warmup-complete callback runs after the first forward and
+does not provide this startup boundary.
+
 A release goes through every allocator loaded in the process (tcmalloc,
 glibc) because the one serving ``malloc`` cannot be detected reliably, and
 an idle allocator ignores the call. ``SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC``
@@ -35,7 +40,10 @@ from torch.compiler._cache import CacheArtifactManager
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.page_cache import release_startup_page_cache
+from sglang_tpu.page_cache import (
+    release_startup_page_cache,
+    start_checkpoint_page_cache_release,
+)
 from sglang_tpu.startup_memory import log_startup_memory
 
 logger = get_logger(__name__)
@@ -202,7 +210,7 @@ def _after_freeze() -> None:
 
 
 def install(scheduler_cls: Optional[type] = None) -> None:
-    """Wrap ``Scheduler.handle_freeze_gc`` with the post-warmup trim."""
+    """Start checkpoint eviction before warmup and finish cleanup before GC freeze."""
     if scheduler_cls is None:
         # Safe here, the worker bootstrap has already imported scheduler.py.
         from sglang.srt.managers.scheduler import Scheduler as scheduler_cls
@@ -210,6 +218,12 @@ def install(scheduler_cls: Optional[type] = None) -> None:
     orig = scheduler_cls.handle_freeze_gc
     if getattr(orig, "_tpu_host_heap_trim", False):
         return
+
+    init_graphs = scheduler_cls.init_all_cuda_graphs
+
+    def init_all_cuda_graphs(self, *args, **kwargs):
+        start_checkpoint_page_cache_release()
+        return init_graphs(self, *args, **kwargs)
 
     def handle_freeze_gc(self, *args, **kwargs):
         release_startup_page_cache()
@@ -223,4 +237,5 @@ def install(scheduler_cls: Optional[type] = None) -> None:
         return result
 
     handle_freeze_gc._tpu_host_heap_trim = True
+    scheduler_cls.init_all_cuda_graphs = init_all_cuda_graphs
     scheduler_cls.handle_freeze_gc = handle_freeze_gc

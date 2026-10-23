@@ -2,7 +2,9 @@
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -120,6 +122,94 @@ def test_startup_discovers_files_only_on_the_host_leader(monkeypatch):
         page_cache.release_startup_page_cache()
     assert events[:4] == ["saves", "barrier", ["target", "draft"], "compiled"]
     assert events[4:] == ["saves", "barrier"] * 7
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_checkpoint_release_overlaps_and_is_joined_before_compiler_cleanup(
+    monkeypatch, fail
+):
+    monkeypatch.setattr(page_cache, "_checkpoint_release", None)
+    entered, release, joining = Event(), Event(), Event()
+    calls = []
+
+    def advise(paths):
+        calls.append(paths)
+        entered.set()
+        assert release.wait(5)
+        if fail:
+            raise OSError("checkpoint advice failed")
+
+    monkeypatch.setenv("SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(
+        page_cache,
+        "get_model",
+        lambda: SimpleNamespace(
+            model_path="target", is_startup_weight_load_overlap=False
+        ),
+    )
+    monkeypatch.setattr(
+        page_cache,
+        "get_spec",
+        lambda: SimpleNamespace(speculative_draft_model_path="draft"),
+    )
+    monkeypatch.setattr(
+        page_cache,
+        "get_parallel",
+        lambda: SimpleNamespace(world_group=SimpleNamespace(barrier=lambda: None)),
+    )
+    monkeypatch.setattr(page_cache, "release_checkpoint_page_cache", advise)
+    monkeypatch.setattr(page_cache, "resolve_compilations", lambda _: joining.set())
+    monkeypatch.setattr(
+        page_cache, "release_compile_artifacts", lambda: calls.append("compiler")
+    )
+    page_cache.start_checkpoint_page_cache_release()
+    try:
+        assert entered.wait(5)
+        for rank in range(8):
+            monkeypatch.setenv("LOCAL_RANK", str(rank))
+            page_cache.start_checkpoint_page_cache_release()
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            finished = pool.submit(page_cache.release_startup_page_cache)
+            assert joining.wait(5)
+            assert not finished.done()
+            assert calls == [["target", "draft"]]
+            release.set()
+            if fail:
+                with pytest.raises(OSError, match="checkpoint advice failed"):
+                    finished.result(timeout=5)
+                assert calls == [["target", "draft"]]
+            else:
+                finished.result(timeout=5)
+                assert calls == [["target", "draft"], "compiler"]
+                assert page_cache._checkpoint_release is None
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("enabled, overlap", [(False, False), (True, True)])
+def test_checkpoint_release_skip_preserves_collective_order(
+    monkeypatch, enabled, overlap
+):
+    monkeypatch.setattr(page_cache, "_checkpoint_release", None)
+    barriers = []
+    monkeypatch.setenv("SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE", str(int(enabled)))
+    monkeypatch.setattr(
+        page_cache,
+        "get_model",
+        lambda: SimpleNamespace(is_startup_weight_load_overlap=overlap),
+    )
+    monkeypatch.setattr(
+        page_cache,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            world_group=SimpleNamespace(barrier=lambda: barriers.append("barrier"))
+        ),
+    )
+    page_cache.start_checkpoint_page_cache_release()
+    assert barriers == ["barrier"]
+    assert page_cache._checkpoint_release is None
 
 
 @pytest.mark.parametrize(
