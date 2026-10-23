@@ -207,7 +207,7 @@ def main():
     if new:
         log(f"discovered pools not in topology.yaml: {' '.join(new)}")
     if new and a.sync:
-        # Needs the cluster-scoped grant in kueue-ci-rbac.yaml.
+        # CI may not create flavors; a new pool's flavor is added to kueue-tpu.yaml first.
         existing = {
             f["spec"]["nodeLabels"][POOL_LABEL]: f["metadata"]["name"]
             for f in kget("resourceflavors")

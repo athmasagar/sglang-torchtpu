@@ -154,9 +154,9 @@ Every in-project job calls this workflow; its work is one shell step. In order:
    - **P/D:** prefill and decode replicated jobs, with `CI_PD_ROLE` set.
 4. **Quota.** `reconcile_quota.py --pool=P` sets each CI ClusterQueue's quota from the live
    chip count (for the shared pool, pr-gate's hosts and nightly's rest), and refuses to
-   submit if a multi-host pool holds more than one slice. It needs the grant in
-   `kueue-ci-rbac.yaml`; steps 2 and 4 fail the job on any error rather than carrying on
-   with stale quota.
+   submit if a multi-host pool holds more than one slice. It needs the `tpu-ci-kueue-sync`
+   grant (Enabling Kueue, step 3); steps 2 and 4 fail the job on any error rather than
+   carrying on with stale quota.
 5. **Submit and admission.** `kubectl create` the JobSet (suspended, labelled with the
    queue), then check that Kueue created a Workload for it; no Workload fails the job.
    Wait for admission (pods appear) for up to `admit_s`; running out is
@@ -246,7 +246,6 @@ and the admission budget.
 | `.github/workflows/_tpu-test.yml` | Reusable: run one job on TPU (steps above) |
 | `.github/tpu-ci/topology.yaml` | `(lane, hosts)` to shape, pools and queue; the shared pool and pr-gate's hosts |
 | `.github/tpu-ci/kueue-tpu.yaml` | ResourceFlavors, ClusterQueues, LocalQueues |
-| `.github/tpu-ci/kueue-ci-rbac.yaml` | Lets `tpu-ci@` patch the CI ClusterQueues and create flavors (cluster-scoped) |
 | `.github/tpu-ci/kueue-controller-resources.yaml` | Lowers the Kueue controller's CPU request to fit `system-pool`; re-apply after every Kueue upgrade |
 | `.github/tpu-ci/discover_pools.py` | Pools for a `(lane, hosts)`; registers new pools with Kueue |
 | `.github/tpu-ci/reconcile_quota.py` | Sets queue quotas from live chips (and the shared pool's split); refuses a multi-host pool holding two slices |
@@ -267,7 +266,7 @@ cluster's identities are repository secrets (`EXTERNAL_*`; see
 [`external/README.md`](external/README.md)).
 
 `tpu-ci@` needs `container.developer`, `artifactregistry.writer` and `logging.logWriter`
-in the project, the cluster-scoped Kueue grant in `kueue-ci-rbac.yaml`, and a Workload Identity binding from the `github` WIF pool scoped to
+in the project, the cluster-scoped `tpu-ci-kueue-sync` grant (Enabling Kueue, step 3), and a Workload Identity binding from the `github` WIF pool scoped to
 `sgl-project/sglang-torchtpu`. Test pods run in namespace `tpu-ci`.
 
 New CI node pools: `--machine-type=tpu7x-standard-4t`, `--reservation-affinity=specific`
@@ -474,12 +473,20 @@ Then confirm nothing unexpected was caught: `kubectl get workloads -A`.
 kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
 kubectl get clusterqueues -o wide        # ACTIVE=True on each
 kubectl -n tpu-ci get localqueues
-kubectl apply -f .github/tpu-ci/kueue-ci-rbac.yaml
+# CI's quota sync patches the CI queues; ClusterQueues are cluster-scoped, which
+# container.developer does not cover. List every CI queue here.
+kubectl create clusterrole tpu-ci-kueue-sync --verb=get,patch \
+  --resource=clusterqueues.kueue.x-k8s.io \
+  --resource-name=tpu-prgate-1h --resource-name=tpu-nightly-1h --resource-name=tpu-nightly-2h
+kubectl create clusterrolebinding tpu-ci-kueue-sync --clusterrole=tpu-ci-kueue-sync \
+  --user=tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
 kubectl auth can-i patch clusterqueues/tpu-prgate-1h \
   --as=tpu-ci@sglang-torchtpu.iam.gserviceaccount.com   # yes
 ```
 
-Without `kueue-ci-rbac.yaml`, every CI job fails at the quota step with `Forbidden`.
+Without that grant, every CI job fails at the quota step with `Forbidden`. CI cannot create
+ResourceFlavors: a new pool's flavor goes into `kueue-tpu.yaml` before the pool is labelled
+`ci-tpu-lane`, or the job that discovers it fails.
 
 `ACTIVE=True` is necessary but not sufficient. A queue is Active as soon as its flavors
 resolve, even if it can never admit anything — so also check that a real workload reaches
