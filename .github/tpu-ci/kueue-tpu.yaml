@@ -33,7 +33,7 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-# pr-gate and nightly share the 2x2x1 pool (topology.yaml `merged_pools`). The same
+# pr-gate and nightly share the 2x2x1 pool (both list it in topology.yaml). The same
 # cohortName is what lets one queue use the other's idle quota.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue

@@ -37,9 +37,10 @@ CI pools:
 | `ci-tpu7x-2x2x1`, `ci-tpu7x-2x2x1-nightly` | `ci-2x2x1` | 2x2x1 | 8 | 32 | `tpu-prgate-1h`, `tpu-nightly-1h` |
 | `ci-tpu7x-2x2x2` | `nightly` | 2x2x2 | 2 (one slice) | 8 | `tpu-nightly-2h` |
 
-**The 2x2x1 pool is shared** by pr-gate and nightly (`merged_pools` in `topology.yaml`):
+**The 2x2x1 pool is shared** by pr-gate and nightly: both lanes list `ci-2x2x1` in
+`topology.yaml`, and pr-gate's entry carries `min_hosts`.
 
-- pr-gate always keeps `pr_gate_hosts` hosts (5). They are never lent, so a PR never waits
+- pr-gate always keeps `min_hosts` hosts (5). They are never lent, so a PR never waits
   behind a nightly job.
 - nightly holds every other host. When a host frees up, a waiting nightly job gets it
   before a PR job that would have to borrow it.
@@ -213,7 +214,7 @@ and the admission budget.
 | A perf suite | Register it, add the suite to `run_suite.py`, and add the entry to both lists in `perf-test-tpu.yml` (the `model` choice and the default list), plus the `model` dispatch option. |
 | An accuracy benchmark | Register it, add the suite to `run_suite.py`, and add a job to `accuracy-test-tpu.yml` with its slot list. Keep `run_name` to 34 characters: it prefixes pod names, which are capped at 63. |
 | A hand-wired P/D or exec test | A job in `feature-validation-tpu.yml` with `files:`, plus the `only` dispatch option in both nightly workflows. |
-| A 2x2x1 host | Resize either 2x2x1 node pool. nightly's share grows; pr-gate's is `pr_gate_hosts` in `topology.yaml`. |
+| A 2x2x1 host | Resize either 2x2x1 node pool. nightly's share grows; pr-gate's is `min_hosts` in `topology.yaml`. |
 | A multi-host slice | A new node pool with a unique `ci-tpu-pool` and `ci-tpu-lane=<lane>`, `--tpu-topology`, and a workload policy. |
 
 `est_time` is read by the CI, not decoration; see Budgets.
@@ -244,7 +245,7 @@ and the admission budget.
 | `.github/workflows/combo-test-tpu.yml` | Dispatch-only trigger for the GPT-OSS-120B 2P+2D test |
 | `.github/workflows/_tpu-build.yml` | Reusable: build the image once, output its digest |
 | `.github/workflows/_tpu-test.yml` | Reusable: run one job on TPU (steps above) |
-| `.github/tpu-ci/topology.yaml` | `(lane, hosts)` to shape, pools and queue; the shared pool and pr-gate's hosts |
+| `.github/tpu-ci/topology.yaml` | `(lane, hosts)` to shape, pools and queue; which pools two lanes share, and `min_hosts` |
 | `.github/tpu-ci/kueue-tpu.yaml` | ResourceFlavors, ClusterQueues, LocalQueues |
 | `.github/tpu-ci/kueue-controller-resources.yaml` | Lowers the Kueue controller's CPU request to fit `system-pool`; re-apply after every Kueue upgrade |
 | `.github/tpu-ci/discover_pools.py` | Pools for a `(lane, hosts)`; registers new pools with Kueue |

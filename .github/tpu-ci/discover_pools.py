@@ -215,9 +215,16 @@ def main():
         }
         queue = entry.get("queue")
         for pool in new:
-            flavor = ensure_flavor(pool, found[pool], existing, a.dry_run)
+            flavor = ensure_flavor(
+                pool=pool, topology=found[pool], existing=existing, dry_run=a.dry_run
+            )
             if queue:
-                ensure_in_queue(queue, flavor, chips_in_pool(nodes, pool), a.dry_run)
+                ensure_in_queue(
+                    queue=queue,
+                    flavor=flavor,
+                    chips=chips_in_pool(nodes=nodes, pool=pool),
+                    dry_run=a.dry_run,
+                )
 
     # Union collapses to `found` once every pool carries ci-tpu-lane -- see the TODO above.
     print(" ".join(sorted(set(static) | set(found))))

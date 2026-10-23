@@ -22,6 +22,8 @@ import re
 import subprocess
 import sys
 
+import yaml
+
 POOL_LABEL = "ci-tpu-pool"
 TPU = "google.com/tpu"
 CHIPS_PER_HOST = 4  # tpu7x-standard-4t
@@ -97,40 +99,48 @@ def chips_per_pool(nodes):
     return chips
 
 
-def quantity(n, unit):
+def _quantity(n, unit):
     # The API server stores a zero quantity as "0", whatever unit it was written with.
     return f"{n}{unit}" if n else "0"
 
 
-def resources(chips, lend_tpu=True):
+def _resources(chips, lend_tpu=True):
     """TPU quota plus the cpu/memory derived from it, in the ClusterQueue's own shape."""
     out = []
     for name, per_chip, unit in ((TPU, 1, ""), ("cpu", 1, ""), ("memory", 8, "Gi")):
-        r = {"name": name, "nominalQuota": quantity(chips * per_chip, unit)}
+        r = {"name": name, "nominalQuota": _quantity(n=chips * per_chip, unit=unit)}
         if name == TPU and not lend_tpu:
             r["lendingLimit"] = "0"
         out.append(r)
     return out
 
 
-def merged_quotas(topo, chips):
-    """{(queue, pool): (chips, lend_tpu)} for the pools topology.yaml `merged_pools` shares.
+def _shared_pool_quotas(topo, chips):
+    """{(queue, pool): (chips, lend_tpu)} for pools that two lanes list in topology.yaml.
 
-    pr-gate gets `pr_gate_hosts` hosts (or every live one, if fewer) and never lends them;
-    nightly gets the rest and lends whatever it is not using.
+    The lane with `min_hosts` gets that many hosts (or every live one, if fewer) and never
+    lends them; the other lane gets the rest and lends what it is not using.
     """
+    users = {}
+    for slices in topo["lanes"].values():
+        for entry in slices.values():
+            for pool in entry["pools"]:
+                users.setdefault(pool, []).append(entry)
     out = {}
-    for pool, cfg in (topo.get("merged_pools") or {}).items():
-        queue = {
-            lane: entry["queue"]
-            for lane in ("pr-gate", "nightly")
-            for entry in topo["lanes"][lane].values()
-            if pool in entry["pools"]
-        }
+    for pool, entries in users.items():
+        if len(entries) < 2:
+            continue
+        keepers = [e for e in entries if "min_hosts" in e]
+        if len(entries) != 2 or len(keepers) != 1:
+            sys.exit(
+                f"shared pool {pool!r} needs two lanes, exactly one with min_hosts"
+            )
+        keeper = keepers[0]
+        other = next(e for e in entries if e is not keeper)
         live = chips.get(pool, 0)
-        pr_gate = min(live, cfg["pr_gate_hosts"] * CHIPS_PER_HOST)
-        out[(queue["pr-gate"], pool)] = (pr_gate, False)
-        out[(queue["nightly"], pool)] = (live - pr_gate, True)
+        kept = min(live, keeper["min_hosts"] * CHIPS_PER_HOST)
+        out[(keeper["queue"], pool)] = (kept, False)
+        out[(other["queue"], pool)] = (live - kept, True)
     return out
 
 
@@ -151,10 +161,8 @@ def main():
         if (f.get("spec") or {}).get("nodeLabels", {}).get(POOL_LABEL)
     }
     cqs = kget("clusterqueues")
-    import yaml  # lazy: the lint job runs this module's tests without site-packages
-
     with open(TOPOLOGY_FILE) as f:
-        shared = merged_quotas(topo=yaml.safe_load(f), chips=chips)
+        shared = _shared_pool_quotas(topo=yaml.safe_load(f), chips=chips)
 
     for cq in cqs:
         name = cq["metadata"]["name"]
@@ -167,7 +175,7 @@ def main():
                     flavors.append(fl)
                     continue
                 n, lend = shared.get((name, pool), (chips.get(pool, 0), True))
-                want = resources(chips=n, lend_tpu=lend)
+                want = _resources(chips=n, lend_tpu=lend)
                 have = [{k: str(v) for k, v in r.items()} for r in fl["resources"]]
                 if have != want:
                     changed = True

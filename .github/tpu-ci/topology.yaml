@@ -14,15 +14,12 @@
 #   queue    : Kueue LocalQueue in tpu-ci (kueue-tpu.yaml). One per (lane, hosts): a 2-host
 #              job's 8 chips would satisfy a single-host flavor's quota while being
 #              unschedulable, so the shapes must not share a ClusterQueue.
+#   min_hosts: on a pool two lanes share, the hosts this lane always keeps. The other lane
+#              holds the rest, gets freed hosts first, and lends them while it is idle.
+#              reconcile_quota.py turns this into both queues' quotas from live hosts.
 lanes:
   pr-gate:
-    1: { topology: 2x2x1, pools: [ci-2x2x1], queue: tpu-prgate-1h }   # merged pool, below
+    1: { topology: 2x2x1, pools: [ci-2x2x1], queue: tpu-prgate-1h, min_hosts: 5 }
   nightly:
-    1: { topology: 2x2x1, pools: [ci-2x2x1], queue: tpu-nightly-1h }  # merged pool, below
+    1: { topology: 2x2x1, pools: [ci-2x2x1], queue: tpu-nightly-1h }
     2: { topology: 2x2x2, pools: [nightly],  queue: tpu-nightly-2h }  # 1 slice = 2 hosts
-
-# Pools pr-gate and nightly share. pr-gate always keeps `pr_gate_hosts` hosts; nightly holds
-# every other host and gets freed hosts first, and pr-gate may use them while nightly is
-# idle. reconcile_quota.py turns this into the two queues' quotas from the live host count.
-merged_pools:
-  ci-2x2x1: { pr_gate_hosts: 5 }
