@@ -12,10 +12,8 @@ rules:
     resources: ["clusterqueues"]
     resourceNames:
       - tpu-prgate-1h
-      - tpu-prgate-2h
       - tpu-nightly-1h
       - tpu-nightly-2h
-      - tpu-nightly-4h
     verbs: ["get", "patch"]
   - apiGroups: ["kueue.x-k8s.io"]
     resources: ["clusterqueues", "resourceflavors"]

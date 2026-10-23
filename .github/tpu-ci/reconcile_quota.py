@@ -24,6 +24,7 @@ import sys
 
 POOL_LABEL = "ci-tpu-pool"
 TPU = "google.com/tpu"
+CHIPS_PER_HOST = 4  # tpu7x-standard-4t
 TOPOLOGY_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "topology.yaml"
 )
@@ -101,67 +102,35 @@ def quantity(n, unit):
     return f"{n}{unit}" if n else "0"
 
 
-def resources(chips, lending_limit=None):
+def resources(chips, lend_tpu=True):
     """TPU quota plus the cpu/memory derived from it, in the ClusterQueue's own shape."""
     out = []
     for name, per_chip, unit in ((TPU, 1, ""), ("cpu", 1, ""), ("memory", 8, "Gi")):
         r = {"name": name, "nominalQuota": quantity(chips * per_chip, unit)}
-        if lending_limit is not None:
-            r["lendingLimit"] = quantity(lending_limit * per_chip, unit)
+        if name == TPU and not lend_tpu:
+            r["lendingLimit"] = "0"
         out.append(r)
     return out
 
 
-def load_cohorts(path):
-    """[(hosts, {lane: queue}, {lane: reserved slices})] from topology.yaml `cohorts`."""
-    import yaml  # lazy: the lint job runs this module's tests without site-packages
+def merged_quotas(topo, chips):
+    """{(queue, pool): (chips, lend_tpu)} for the pools topology.yaml `merged_pools` shares.
 
-    with open(path) as f:
-        topo = yaml.safe_load(f)
-    out = []
-    for c in (topo.get("cohorts") or {}).values():
-        hosts = c["hosts"]
-        queues = {lane: topo["lanes"][lane][hosts]["queue"] for lane in c["lanes"]}
-        out.append((hosts, queues, dict(c.get("reserve") or {})))
-    return out
-
-
-def cohort_quotas(cohorts, cqs, flavor_pool, chips):
-    """{(queue, flavor): (nominal chips, lendingLimit chips or None)} for cohort members.
-
-    Each reserving lane takes its slices from the pools in its ClusterQueue's flavor order
-    and lends none of them; the one lane without a reserve gets every chip left over.
+    pr-gate gets `pr_gate_hosts` hosts (or every live one, if fewer) and never lends them;
+    nightly gets the rest and lends whatever it is not using.
     """
-    flavor_order = {
-        cq["metadata"]["name"]: [
-            fl["name"]
-            for g in cq["spec"].get("resourceGroups", [])
-            for fl in g.get("flavors", [])
-            if fl["name"] in flavor_pool
-        ]
-        for cq in cqs
-    }
     out = {}
-    for hosts, queues, reserve in cohorts:
-        rest = [lane for lane in queues if lane not in reserve]
-        if len(rest) != 1:
-            sys.exit(
-                f"cohort {sorted(queues)} needs exactly one lane without a reserve"
-            )
-        flavors = list(
-            dict.fromkeys(f for q in queues.values() for f in flavor_order.get(q, []))
-        )
-        left = {f: chips.get(flavor_pool[f], 0) for f in flavors}
-        slice_chips = 4 * hosts
-        for lane, slices in reserve.items():
-            need = slices * slice_chips
-            for f in flavor_order.get(queues[lane], []):
-                take = min(need, left[f]) // slice_chips * slice_chips
-                out[(queues[lane], f)] = (take, 0)
-                left[f] -= take
-                need -= take
-        for f in flavors:
-            out[(queues[rest[0]], f)] = (left[f], None)
+    for pool, cfg in (topo.get("merged_pools") or {}).items():
+        queue = {
+            lane: entry["queue"]
+            for lane in ("pr-gate", "nightly")
+            for entry in topo["lanes"][lane].values()
+            if pool in entry["pools"]
+        }
+        live = chips.get(pool, 0)
+        pr_gate = min(live, cfg["pr_gate_hosts"] * CHIPS_PER_HOST)
+        out[(queue["pr-gate"], pool)] = (pr_gate, False)
+        out[(queue["nightly"], pool)] = (live - pr_gate, True)
     return out
 
 
@@ -182,12 +151,10 @@ def main():
         if (f.get("spec") or {}).get("nodeLabels", {}).get(POOL_LABEL)
     }
     cqs = kget("clusterqueues")
-    shared = cohort_quotas(
-        cohorts=load_cohorts(TOPOLOGY_FILE),
-        cqs=cqs,
-        flavor_pool=flavor_pool,
-        chips=chips,
-    )
+    import yaml  # lazy: the lint job runs this module's tests without site-packages
+
+    with open(TOPOLOGY_FILE) as f:
+        shared = merged_quotas(topo=yaml.safe_load(f), chips=chips)
 
     for cq in cqs:
         name = cq["metadata"]["name"]
@@ -199,8 +166,8 @@ def main():
                 if pool is None:
                     flavors.append(fl)
                     continue
-                n, lend = shared.get((name, fl["name"]), (chips.get(pool, 0), None))
-                want = resources(chips=n, lending_limit=lend)
+                n, lend = shared.get((name, pool), (chips.get(pool, 0), True))
+                want = resources(chips=n, lend_tpu=lend)
                 have = [{k: str(v) for k, v in r.items()} for r in fl["resources"]]
                 if have != want:
                     changed = True

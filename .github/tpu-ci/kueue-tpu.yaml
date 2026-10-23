@@ -1,45 +1,21 @@
 # Kueue gang-admits the TPU CI JobSets. Install and verification: README "Enabling Kueue".
 #
-# One ResourceFlavor per slice -- GKE tpu7x nodes expose no per-slice label, so ci-tpu-pool
-# is the finest selector and a multi-host pool must hold exactly one slice.
+# One ResourceFlavor per pool (ci-tpu-pool label). GKE tpu7x nodes expose no per-slice
+# label, so a multi-host pool must hold exactly one slice.
 # One ClusterQueue per (lane, hosts), matching topology.yaml's `queue`.
 #
-# Quotas here are a startup default: kueue-quota-reconciler.yaml resets them every 10min
-# from live allocatable chips. cpu and memory are derived from the chip count (pods take
-# 4 chips / 4 cpu / 32Gi, so 1 cpu and 8Gi per chip) to keep TPU the only binding resource.
-# Every resource a pod requests must appear in coveredResources or nothing is admittable.
+# Quotas here are a startup default: reconcile_quota.py resets them from live chips before
+# every CI job. cpu and memory are derived from the chip count (pods take 4 chips / 4 cpu /
+# 32Gi, so 1 cpu and 8Gi per chip) to keep TPU the only binding resource. Every resource a
+# pod requests must appear in coveredResources or nothing is admittable.
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
-  name: tpu7x-2x2x1-pr-gate
+  name: tpu7x-2x2x1-ci
 spec:
   nodeLabels:
-    ci-tpu-pool: pr-gate
-  tolerations:
-    - key: google.com/tpu
-      operator: Exists
-      effect: NoSchedule
----
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ResourceFlavor
-metadata:
-  name: tpu7x-2x2x2-pr-gate
-spec:
-  nodeLabels:
-    ci-tpu-pool: pr-gate-2h
-  tolerations:
-    - key: google.com/tpu
-      operator: Exists
-      effect: NoSchedule
----
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ResourceFlavor
-metadata:
-  name: tpu7x-2x2x1-nightly
-spec:
-  nodeLabels:
-    ci-tpu-pool: nightly-1h
+    ci-tpu-pool: ci-2x2x1
   tolerations:
     - key: google.com/tpu
       operator: Exists
@@ -57,34 +33,8 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ResourceFlavor
-metadata:
-  name: tpu7x-2x2x2-nightly-b
-spec:
-  nodeLabels:
-    ci-tpu-pool: nightly-b
-  tolerations:
-    - key: google.com/tpu
-      operator: Exists
-      effect: NoSchedule
----
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ResourceFlavor
-metadata:
-  name: tpu7x-2x2x4-nightly
-spec:
-  nodeLabels:
-    ci-tpu-pool: nightly-4h
-  tolerations:
-    - key: google.com/tpu
-      operator: Exists
-      effect: NoSchedule
----
-# The 1-host queues share both 2x2x1 pools as cohort tpu-2x2x1 (topology.yaml `cohorts`).
-# reconcile_quota.py sets the split from live chips: pr-gate keeps its reserve and never
-# lends it; nightly holds the rest and lends it to pr-gate while idle. The values here are
-# only a startup default (each lane owns its own pool) until the reconciler runs.
+# pr-gate and nightly share the 2x2x1 pool (topology.yaml `merged_pools`). The same
+# cohortName is what lets one queue use the other's idle quota.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -92,59 +42,20 @@ metadata:
 spec:
   namespaceSelector: {}
   queueingStrategy: BestEffortFIFO
-  cohortName: tpu-2x2x1
-  # Take a pool where the job fits without borrowing before borrowing on the first one.
-  flavorFungibility:
-    whenCanBorrow: TryNextFlavor
-  # Lent chips come back as borrowed jobs finish; running jobs are never preempted.
-  preemption:
-    reclaimWithinCohort: Never
+  cohortName: ci-2x2x1
   resourceGroups:
     - coveredResources: ["google.com/tpu", "cpu", "memory"]
       flavors:
-        - name: tpu7x-2x2x1-pr-gate
+        - name: tpu7x-2x2x1-ci
           resources:
             - name: "google.com/tpu"
-              nominalQuota: 8
+              nominalQuota: 20
+              # pr-gate's hosts are never lent, so a PR never waits behind nightly.
               lendingLimit: 0
             - name: "cpu"
-              nominalQuota: 8
-              lendingLimit: 0
+              nominalQuota: 20
             - name: "memory"
-              nominalQuota: 64Gi
-              lendingLimit: "0"
-        - name: tpu7x-2x2x1-nightly
-          resources:
-            - name: "google.com/tpu"
-              nominalQuota: 0
-              lendingLimit: 0
-            - name: "cpu"
-              nominalQuota: 0
-              lendingLimit: 0
-            - name: "memory"
-              nominalQuota: "0"
-              lendingLimit: "0"
----
-# One slice = 8 chips = one concurrent job. No headroom possible: a 2-host job needs
-# exactly 8, so any lower value admits nothing.
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ClusterQueue
-metadata:
-  name: tpu-prgate-2h
-spec:
-  namespaceSelector: {}
-  queueingStrategy: BestEffortFIFO
-  resourceGroups:
-    - coveredResources: ["google.com/tpu", "cpu", "memory"]
-      flavors:
-        - name: tpu7x-2x2x2-pr-gate
-          resources:
-            - name: "google.com/tpu"
-              nominalQuota: 8
-            - name: "cpu"
-              nominalQuota: 8
-            - name: "memory"
-              nominalQuota: 64Gi
+              nominalQuota: 160Gi
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
@@ -153,17 +64,11 @@ metadata:
 spec:
   namespaceSelector: {}
   queueingStrategy: BestEffortFIFO
-  cohortName: tpu-2x2x1
-  # Take a pool where the job fits without borrowing before borrowing on the first one.
-  flavorFungibility:
-    whenCanBorrow: TryNextFlavor
-  # Lent chips come back as borrowed jobs finish; running jobs are never preempted.
-  preemption:
-    reclaimWithinCohort: Never
+  cohortName: ci-2x2x1
   resourceGroups:
     - coveredResources: ["google.com/tpu", "cpu", "memory"]
       flavors:
-        - name: tpu7x-2x2x1-nightly
+        - name: tpu7x-2x2x1-ci
           resources:
             - name: "google.com/tpu"
               nominalQuota: 12
@@ -171,16 +76,8 @@ spec:
               nominalQuota: 12
             - name: "memory"
               nominalQuota: 96Gi
-        - name: tpu7x-2x2x1-pr-gate
-          resources:
-            - name: "google.com/tpu"
-              nominalQuota: 0
-            - name: "cpu"
-              nominalQuota: 0
-            - name: "memory"
-              nominalQuota: "0"
 ---
-# One slice. A second = new pool + new flavor + one more entry here; no workflow change.
+# One 2x2x2 slice = 8 chips = one concurrent 2-host job.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -199,34 +96,6 @@ spec:
               nominalQuota: 8
             - name: "memory"
               nominalQuota: 64Gi
-        - name: tpu7x-2x2x2-nightly-b
-          resources:
-            - name: "google.com/tpu"
-              nominalQuota: 8
-            - name: "cpu"
-              nominalQuota: 8
-            - name: "memory"
-              nominalQuota: 64Gi
----
-# One slice = 16 chips. Exact, same reason as the 2-host queues.
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ClusterQueue
-metadata:
-  name: tpu-nightly-4h
-spec:
-  namespaceSelector: {}
-  queueingStrategy: BestEffortFIFO
-  resourceGroups:
-    - coveredResources: ["google.com/tpu", "cpu", "memory"]
-      flavors:
-        - name: tpu7x-2x2x4-nightly
-          resources:
-            - name: "google.com/tpu"
-              nominalQuota: 16
-            - name: "cpu"
-              nominalQuota: 16
-            - name: "memory"
-              nominalQuota: 128Gi
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
@@ -235,14 +104,6 @@ metadata:
   namespace: tpu-ci
 spec:
   clusterQueue: tpu-prgate-1h
----
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: LocalQueue
-metadata:
-  name: tpu-prgate-2h
-  namespace: tpu-ci
-spec:
-  clusterQueue: tpu-prgate-2h
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
@@ -259,11 +120,3 @@ metadata:
   namespace: tpu-ci
 spec:
   clusterQueue: tpu-nightly-2h
----
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: LocalQueue
-metadata:
-  name: tpu-nightly-4h
-  namespace: tpu-ci
-spec:
-  clusterQueue: tpu-nightly-4h

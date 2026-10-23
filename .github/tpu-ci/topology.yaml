@@ -16,22 +16,13 @@
 #              unschedulable, so the shapes must not share a ClusterQueue.
 lanes:
   pr-gate:
-    1: { topology: 2x2x1, pools: [pr-gate, nightly-1h], queue: tpu-prgate-1h }   # cohort tpu-2x2x1
-    2: { topology: 2x2x2, pools: [pr-gate-2h],          queue: tpu-prgate-2h }   # 1 slice = 2 hosts
+    1: { topology: 2x2x1, pools: [ci-2x2x1], queue: tpu-prgate-1h }   # merged pool, below
   nightly:
-    1: { topology: 2x2x1, pools: [pr-gate, nightly-1h], queue: tpu-nightly-1h }  # cohort tpu-2x2x1
-    2: { topology: 2x2x2, pools: [nightly, nightly-b],  queue: tpu-nightly-2h }  # 2 slices x 2 hosts
-    4: { topology: 2x2x4, pools: [nightly-4h],          queue: tpu-nightly-4h }  # 1 slice = 4 hosts
+    1: { topology: 2x2x1, pools: [ci-2x2x1], queue: tpu-nightly-1h }  # merged pool, below
+    2: { topology: 2x2x2, pools: [nightly],  queue: tpu-nightly-2h }  # 1 slice = 2 hosts
 
-# Lanes whose slices of one host count share capacity through a Kueue cohort (kueue-tpu.yaml).
-# Every member lane's pods may land on every member pool, so discover_pools.py resolves the
-# pool set across all member lanes. reconcile_quota.py splits the pools' live chips:
-#   reserve : slices a lane is guaranteed and never lends; filled from the pools listed
-#             first in its ClusterQueue.
-#   the lane without a reserve takes every remaining chip as nominal quota and lends what
-#   it is not using; it gets those chips back as borrowed jobs finish (no preemption).
-cohorts:
-  tpu-2x2x1:
-    hosts: 1
-    lanes: [pr-gate, nightly]
-    reserve: { pr-gate: 5 }
+# Pools pr-gate and nightly share. pr-gate always keeps `pr_gate_hosts` hosts; nightly holds
+# every other host and gets freed hosts first, and pr-gate may use them while nightly is
+# idle. reconcile_quota.py turns this into the two queues' quotas from the live host count.
+merged_pools:
+  ci-2x2x1: { pr_gate_hosts: 5 }

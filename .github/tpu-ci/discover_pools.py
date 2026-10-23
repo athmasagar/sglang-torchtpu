@@ -77,14 +77,6 @@ def discover(nodes, lane, hosts):
     return found
 
 
-def member_lanes(topo, lane, hosts):
-    """`lane` plus every lane sharing its `hosts`-host slices through a topology.yaml cohort."""
-    for c in (topo.get("cohorts") or {}).values():
-        if c["hosts"] == hosts and lane in c["lanes"]:
-            return list(c["lanes"])
-    return [lane]
-
-
 def chips_in_pool(nodes, pool):
     return sum(
         int(n["status"]["allocatable"].get(TPU, 0))
@@ -193,10 +185,10 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    with open(a.topology_file) as f:
-        topo = yaml.safe_load(f)
-    entry = topo["lanes"].get(a.lane, {}).get(a.hosts) or {}
-    lanes = member_lanes(topo, a.lane, a.hosts)
+    entry = (
+        yaml.safe_load(open(a.topology_file))["lanes"].get(a.lane, {}).get(a.hosts)
+        or {}
+    )
     static = list(entry.get("pools", []))
     if not static:
         log(f"⚠️  no topology.yaml entry for lane={a.lane} hosts={a.hosts}")
@@ -204,9 +196,7 @@ def main():
     nodes = kget("nodes")
     if not nodes:
         sys.exit("no nodes returned")
-    found = {}
-    for lane in lanes:
-        found.update(discover(nodes, lane, a.hosts))
+    found = discover(nodes, a.lane, a.hosts)
 
     # A multi-host pool holding two slices would let a gang straddle them and hang at ICI
     # rendezvous; refuse before that pool reaches a nodeAffinity list.
@@ -223,17 +213,11 @@ def main():
             for f in kget("resourceflavors")
             if (f.get("spec") or {}).get("nodeLabels", {}).get(POOL_LABEL)
         }
-        queues = [
-            topo["lanes"][lane][a.hosts]["queue"]
-            for lane in lanes
-            if topo["lanes"].get(lane, {}).get(a.hosts, {}).get("queue")
-        ]
+        queue = entry.get("queue")
         for pool in new:
             flavor = ensure_flavor(pool, found[pool], existing, a.dry_run)
-            for queue in queues:
-                # A cohort's split is reconcile_quota.py's to set; start shared pools at 0.
-                chips = chips_in_pool(nodes, pool) if len(queues) == 1 else 0
-                ensure_in_queue(queue, flavor, chips, a.dry_run)
+            if queue:
+                ensure_in_queue(queue, flavor, chips_in_pool(nodes, pool), a.dry_run)
 
     # Union collapses to `found` once every pool carries ci-tpu-lane -- see the TODO above.
     print(" ".join(sorted(set(static) | set(found))))
