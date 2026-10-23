@@ -595,8 +595,7 @@ def _register_models() -> None:
     """Add the model implementations that only this package provides to the registry."""
     from sglang.srt.models.registry import ModelRegistry
 
-    # External models can resolve without importing the unused core catalog.
-    # Other architectures load both catalogs and retain duplicate checks.
+    # Preserve the external-model fast path without importing unused catalogs.
     ModelRegistry.register_lazy("sglang_tpu.models")
 
 

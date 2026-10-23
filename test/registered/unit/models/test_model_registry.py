@@ -97,6 +97,17 @@ class TestLazyDefaultModels(CustomTestCase):
         self.assertIs(self.registry.resolve_model_cls("DefaultArch")[0], _DefaultModel)
         self.assertEqual(self.import_calls, [DEFAULT_PACKAGE, "backend.models"])
 
+    def test_lazy_registration_after_defaults_preserves_eager_overwrite(self):
+        self.registry.get_supported_archs()
+        self.import_calls.clear()
+        self.registry.register_lazy("backend.models")
+        self.assertEqual(self.import_calls, [])
+
+        self.registry.register("another.models", overwrite=True)
+        self.assertEqual(self.import_calls, ["backend.models", "another.models"])
+        self.assertIs(self.registry.resolve_model_cls("BackendArch")[0], _ExternalModel)
+        self.assertIs(self.registry.resolve_model_cls("DefaultArch")[0], _ExternalModel)
+
     def test_lazy_duplicate_still_fails_when_catalog_is_loaded(self):
         self.registry.register_lazy("another.models")
         for _ in range(2):

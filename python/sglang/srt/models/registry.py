@@ -23,7 +23,7 @@ class _ModelRegistry:
     _default_models_loaded: bool = True
     _pending_packages: List[Tuple[str, bool]] = field(default_factory=list)
 
-    def _load_default_models(self):
+    def _load_models(self):
         if not self._default_models_loaded:
             self.models = import_model_classes("sglang.srt.models") | self.models
             self._default_models_loaded = True
@@ -34,21 +34,13 @@ class _ModelRegistry:
             self._pending_packages.pop(0)
 
     def register_lazy(self, package_name: str, strict: bool = False):
-        """Register additional models when the default catalog is needed.
-
-        An already registered external architecture can resolve without loading
-        this package or the default catalog. Duplicate checks run when the
-        deferred package is loaded; packages cannot override existing models.
-        """
-        if self._default_models_loaded:
-            self.register(package_name, strict=strict)
-        else:
-            self._pending_packages.append((package_name, strict))
+        """Defer package imports and duplicate checks until catalog loading."""
+        self._pending_packages.append((package_name, strict))
 
     def register(
         self, package_name: str, overwrite: bool = False, strict: bool = False
     ):
-        self._load_default_models()
+        self._load_models()
         new_models = import_model_classes(package_name, strict=strict)
         self._register_classes(new_models, overwrite=overwrite)
 
@@ -62,7 +54,7 @@ class _ModelRegistry:
         self.models.update(new_models)
 
     def get_supported_archs(self) -> AbstractSet[str]:
-        self._load_default_models()
+        self._load_models()
         return self.models.keys()
 
     def is_arch_supported(self, architecture: str) -> bool:
@@ -120,7 +112,7 @@ class _ModelRegistry:
             if model_cls is not None:
                 return model_cls, first_arch
 
-        self._load_default_models()
+        self._load_models()
         architectures = self._normalize_archs(architectures)
 
         for arch in architectures:
