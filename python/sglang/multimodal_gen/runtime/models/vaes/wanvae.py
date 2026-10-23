@@ -45,8 +45,8 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     disable_spatial_parallel_decode,
     gather_and_trim_height,
     gather_height_for_global_op,
-    split_for_parallel_decode,
     spatial_parallel_decode_disabled,
+    split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
