@@ -166,6 +166,8 @@ class TpuSpecWorker(BaseSpecWorker):
     and result packing are shared.
     """
 
+    supports_logprobs = False
+
     def __init__(
         self,
         target_worker: TpModelWorker,
@@ -1395,7 +1397,7 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError("TpuSpecWorker under PP only extends.")
         if batch.has_grammar:
             raise NotImplementedError("TpuSpecWorker does not support grammar.")
-        if batch.return_logprob:
+        if batch.return_logprob and not self.supports_logprobs:
             raise NotImplementedError("TpuSpecWorker does not support logprobs.")
         sampling_info = batch.sampling_info
         if sampling_info is None:

@@ -1224,6 +1224,12 @@ class TestExperimentalSpecHooks(CustomTestCase):
             check(batch=batch(custom=True), pp_proxy_tensors=None)
         worker._bsearch_filtering = True
         check(batch=batch(top_k=1 << 30, top_p=0.9), pp_proxy_tensors=None)
+        scored = batch()
+        scored.return_logprob = True
+        with self.assertRaisesRegex(NotImplementedError, "logprobs"):
+            check(batch=scored, pp_proxy_tensors=None)
+        worker.supports_logprobs = True
+        check(batch=scored, pp_proxy_tensors=None)
 
     def test_block_draft_input_relays_through_the_future_map(self):
         """RelayPayload.from_draft_input reads the EAGLE seed slots of every draft
@@ -1306,6 +1312,12 @@ class TestExperimentalSpecHooks(CustomTestCase):
             draft.prepare_for_decode(batch)
             self.assertFalse(draft.tpu_host_seq_lens_is_committed)
             self.assertIsNone(draft.tpu_verify_cache_candidates)
+            # Scoring can use the same window when the algorithm keeps the
+            # ordinary N + 1 token commit bound.
+            draft.supports_logprobs = True
+            draft.prepare_for_decode(batch)
+            self.assertTrue(draft.tpu_host_seq_lens_is_committed)
+            self.assertEqual(draft.tpu_verify_cache_candidates.shape, (2, 6))
 
             batch.req_to_token_pool.host_resident = False
             with self.assertRaisesRegex(RuntimeError, "host-resident"):
