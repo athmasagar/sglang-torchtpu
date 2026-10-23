@@ -7,7 +7,8 @@ so each rank stays near its startup peak.
 
 ``install`` wraps ``Scheduler.handle_freeze_gc``, which every scheduler
 runs once right after warmup. The wrapper collects garbage before the
-handler freezes the GC, then releases the free pages.
+handler freezes the GC, then releases the free pages. File caches and export
+records are released before collection.
 
 A release goes through every allocator loaded in the process (tcmalloc,
 glibc) because the one serving ``malloc`` cannot be detected reliably, and
@@ -28,6 +29,7 @@ from typing import Callable, Optional, Tuple
 
 import jax
 import msgspec
+from torch.compiler._cache import CacheArtifactManager
 
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu._logging import get_logger
@@ -151,6 +153,8 @@ def _stop_periodic() -> None:
 
 
 def _before_freeze() -> None:
+    # Startup bundles are saved and background writers joined before this hook.
+    CacheArtifactManager.clear()
     # Serving executables are owned by TorchTPU; discard JAX tracing caches.
     jax.clear_caches()
     # gc.freeze() keeps any cycle it sees forever, so collect first even if
