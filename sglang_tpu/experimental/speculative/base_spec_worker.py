@@ -81,10 +81,10 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
-from sglang_tpu.compilation.eager_warmup import eager_warmup
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.compilation.warmup_queue import eager_warmup
 from sglang_tpu.experimental import register_host_batch_padder
 from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
@@ -316,7 +316,7 @@ class TpuSpecWorker(BaseSpecWorker):
             + [((pbs, 1), torch.float32) for pbs in bucket_sizes]
             + [((pbs, 2 * self.num_verify_rows), torch.int64) for pbs in bucket_sizes]
         )
-        with torch.no_grad(), eager_warmup("spec/logical_bs") as materialize:
+        with torch.no_grad(), eager_warmup() as materialize:
             for bs in live_sizes:
                 # _bucket_state pads the relayed live state to each bucket it can run.
                 for padded_bs in self._decode_buckets_for(bs):
@@ -903,7 +903,7 @@ class TpuSpecWorker(BaseSpecWorker):
         # A multimodal wrapper's eager outer logits processor emits live rows,
         # which TpuSampler pads to the batch bucket (whatever the input modality).
         eager_logits = not self._compile_policy()._compiles_logits_processor()
-        with torch.no_grad(), eager_warmup("spec/extend_sampling") as materialize:
+        with torch.no_grad(), eager_warmup() as materialize:
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
                 for variant in _SAMPLING_WARMUP_VARIANTS:
                     # A target that keeps extend outputs padded samples all cap rows,
