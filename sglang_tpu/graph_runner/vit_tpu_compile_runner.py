@@ -217,24 +217,19 @@ class VisionTpuCompilePolicy(CompilePolicy):
                     direct_compile,
                 )
 
-                # Rank-dependent values (dist.get_rank(), EP expert windows)
-                # are only lifted to tensor inputs when the TP group is the
-                # whole world; without the lift the graphs differ per rank, so
-                # cross-rank sharing must stay off even for spmd_safe policies.
-                lift_rank = (
-                    torch.distributed.is_initialized()
-                    and get_parallel().tp_group.world_size
-                    == torch.distributed.get_world_size()
-                )
                 return direct_compile(
                     torch.no_grad()(method),
                     name=self.name,
-                    spmd_safe=self.spmd_safe and lift_rank,
+                    spmd_safe=self.spmd_safe,
                     specialization_key=lambda *args: tuple(
                         (tuple(t.shape), t.dtype) for t in args
                     ),
                     model=model,
-                    lift_rank=lift_rank,
+                    lift_rank=(
+                        torch.distributed.is_initialized()
+                        and get_parallel().tp_group.world_size
+                        == torch.distributed.get_world_size()
+                    ),
                 )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
         return compiler(

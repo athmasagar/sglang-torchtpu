@@ -834,20 +834,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             ):
                 return fn(input_ids, positions, forward_batch, *args, **kwargs)
 
-        # Rank-dependent values (EP expert windows, rank slices) are only lifted
-        # to tensor inputs when the TP group is the whole world; without the
-        # lift the graphs differ per rank, so cross-rank sharing must stay off
-        # even for spmd_safe policies.
-        lift_rank = (
-            torch.distributed.is_initialized()
-            and get_parallel().tp_group.world_size == torch.distributed.get_world_size()
-        )
         compiled = direct_compile(
             trace_forward,
             specialization_key=self._direct_compile_specialization_key,
             name=self.name,
-            spmd_safe=self.spmd_safe and lift_rank,
-            lift_rank=lift_rank,
+            spmd_safe=self.spmd_safe,
+            lift_rank=(
+                torch.distributed.is_initialized()
+                and get_parallel().tp_group.world_size
+                == torch.distributed.get_world_size()
+            ),
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
             kv_pool=self.get_direct_compile_kv_pool(),
