@@ -372,6 +372,29 @@ def build_hybrid_swa_group(
             mtp_draft_device_pools=mtp_swa_device_pools,
             pool_label="swa",
         )
+        shared_state = getattr(kv_host_pool, "_state", None)
+        if shared_state is not None and shared_state is getattr(
+            swa_host_pool, "_state", None
+        ):
+            has_shared_arena = True
+            if host_swa_evict_fn is not None and host_full_evict_fn is not None:
+                orig_swa_evict = host_swa_evict_fn
+                m_full = max(1, int(getattr(kv_host_pool, "_m", 1)))
+                m_swa = max(1, int(getattr(swa_host_pool, "_m", 1)))
+
+                def _shared_swa_host_evict(need_tokens: int):
+                    res = orig_swa_evict(need_tokens)
+                    need_swa_pages = (
+                        max(0, int(need_tokens)) + page_size - 1
+                    ) // page_size
+                    need_phys_pages = need_swa_pages * m_swa
+                    short_phys_pages = need_phys_pages - len(shared_state.free_pages)
+                    if short_phys_pages > 0:
+                        full_pages = (short_phys_pages + m_full - 1) // m_full
+                        host_full_evict_fn(full_pages * page_size)
+                    return res
+
+                host_swa_evict_fn = _shared_swa_host_evict
     if mtp_swa_device_pools:
         swa_layer_mapping = with_packed_draft_layer_mapping(
             swa_layer_mapping,

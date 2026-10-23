@@ -244,8 +244,10 @@ class _SharedBufferView(TpuFusedMHATokenToKVPool):
         shared_buffers: List[torch.Tensor],
         layer_groups: Optional[List[int]] = None,
         group_pages: Optional[torch.Tensor] = None,
+        parent_pool: Optional[TpuUnifiedSWAKVPool] = None,
         **kwargs,
     ):
+        self.parent_pool = parent_pool
         self._shared_buffers = list(shared_buffers)
         self.layer_groups = (
             list(layer_groups)
@@ -428,6 +430,7 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             allocation_label="Unified",
             **common,
         )
+        self._shared_raiden_state = None
         bufs = self._backing_pool.kv_buffer
         self.full_kv_pool = _SharedBufferView(
             shared_buffers=[bufs[i % G] for i in range(self.full_layer_nums)],
@@ -437,6 +440,7 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             allocation_label="Full",
             layer_groups=[i // G for i in range(self.full_layer_nums)],
             group_pages=self.full_group_pages if self.num_full_groups > 1 else None,
+            parent_pool=self,
             **common,
         )
         self.swa_kv_pool = _SharedBufferView(
@@ -447,8 +451,13 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             allocation_label="SWA",
             layer_groups=[j // G for j in range(self.swa_layer_nums)],
             group_pages=self.swa_group_pages if self.num_swa_groups > 1 else None,
+            parent_pool=self,
             **common,
         )
+        self.full_kv_pool.host_capacity_bytes = sum(
+            self._backing_pool.get_kv_size_bytes()
+        )
+        self.swa_kv_pool.host_capacity_bytes = 0
 
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         self._full_layer_group: Dict[int, int] = {}
