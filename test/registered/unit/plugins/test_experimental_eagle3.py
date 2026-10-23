@@ -400,10 +400,13 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         buckets = SimpleNamespace(next_bucket=lambda bs: 1 << (bs - 1).bit_length())
         with (
+            patch.object(torch, "tpu", create=True) as tpu,
             patch.object(TpuChainSpecWorker, "_compile_policy", return_value=policy),
             patch.object(TpuChainSpecWorker, "_b_bucketer", return_value=buckets),
         ):
             worker._warmup_extend_sampling()
+        tpu.current_stream.assert_called_once_with()
+        tpu.current_stream.return_value.synchronize.assert_called_once_with()
         self.assertEqual({shape for shape, _ in sampled}, {(1,), (2,), (4,)})
         self.assertEqual(
             broadcast,
