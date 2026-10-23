@@ -42,6 +42,12 @@ from sglang_tpu.hooks.kda_weights import (
     bind_glm5_next_kda_weights,
     rehome_kimi_k3_kda_weights,
 )
+from sglang_tpu.hooks.kimi_k3_vision import (
+    attach_k3_vision_runner,
+    bind_k3_vision_runner,
+    encode_with_k3_vision_runner,
+    pass_through_projected_features,
+)
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -62,6 +68,7 @@ from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
+from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hooks
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
     merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
@@ -136,6 +143,26 @@ HOOKS: list[tuple] = [
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture",
         prepare_k3_capture_kernels,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3_vl.MoonViT3dEncoder.__init__",
+        attach_k3_vision_runner,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3ForConditionalGeneration.__init__",
+        bind_k3_vision_runner,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3_vl.KimiK3VisionTower._forward_eager",
+        encode_with_k3_vision_runner,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3_vl.KimiK3MultiModalProjector.forward",
+        pass_through_projected_features,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.layers.attn_residual._aggregate",
@@ -253,6 +280,8 @@ HOOKS: list[tuple] = [
 HOOKS.extend(host_padding_hooks())
 
 HOOKS.extend(hicache_swa_metrics_hooks())
+
+HOOKS.extend(swa_miss_metrics_hooks())
 
 HOOKS.extend(hook_specs())
 

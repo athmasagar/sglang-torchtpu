@@ -8,7 +8,8 @@ to host RAM:
   and prefill sends each request's SWA window fresh.
 - Decode cache hits stop where the SWA window starts, so prefill always sends
   the window and the new tokens.
-- With EAGLE3 or DFlash, the draft KV goes to RAM together with the full-attention KV.
+- With a draft (EAGLE3, DFlash, or DSpark on the experimental worker), the draft
+  KV goes to RAM together with the full-attention KV.
 
 For every raiden PD decode prefix cache, sliding-window or not, a request that
 reuses pages of an unfinished RAM restore waits for it. Restores that load only
@@ -152,14 +153,14 @@ def _validate_full_only_host_cache_config(
             spec_algorithm.supports_pd_decode_swa_hicache(),
             f"speculative algorithm {spec_algorithm.name} is not supported in this mode",
         ),
-        # EAGLE3 and DFlash draft KV reaches RAM through upstream's draft sidecar pool.
+        # EAGLE3 and DFlash-family draft KV reaches RAM through upstream's draft sidecar pool.
         (
-            not (spec_algorithm.is_eagle3() or spec_algorithm.is_dflash())
+            not (spec_algorithm.is_eagle3() or spec_algorithm.is_dflash_family())
             or (
                 hicache_draft_plan is not None
                 and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
             ),
-            "EAGLE3 and DFlash draft KV must use the HiCache draft sidecar",
+            "EAGLE3, DFlash and DSpark draft KV must use the HiCache draft sidecar",
         ),
         # A packed draft lives inside the full KV pool, which this build does
         # not lay out for.

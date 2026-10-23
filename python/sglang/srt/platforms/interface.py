@@ -223,6 +223,13 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports a draft backend for an algorithm."""
         return False
 
+    def supports_speculative_dp_attention(self, algorithm: str) -> bool:
+        """Whether this platform serves the named speculative algorithm under DP attention.
+
+        Consulted only where core rejects an algorithm with DP attention by default.
+        """
+        return False
+
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.
