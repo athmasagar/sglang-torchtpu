@@ -20,12 +20,13 @@ class PrefillState:
     # The pages of send_blocks, for the repeated-page check.
     send_block_set: Dict[int, Set[int]] = field(default_factory=dict)
     send_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
-    # Committed GDN state row of the room, on the state engine.
+    # Committed state row/pages of the room, on the state engine.
     send_state_rows: Dict[int, List[int]] = field(default_factory=dict)
     # Host copy of that row (one array per state tensor), for a resharded room.
     reshard_state: Dict[int, List[Any]] = field(default_factory=dict)
     # Resharded rooms whose row the scheduler thread has gathered for that copy.
     reshard_state_staged: Set[int] = field(default_factory=set)
+    send_state_meta: Dict[int, bytes] = field(default_factory=dict)
     send_aux: Dict[int, bytes] = field(default_factory=dict)
 
     # Decode reply address and the page counts it allocated.

@@ -163,6 +163,11 @@ Both raiden roles serve every algorithm with the same spec flags.
   `decode_dp`; it adds `--enable-dp-lm-head`).
   `test_tpu_gpt_oss_120b_pd_singlehost_pp_{eagle3,dflash}_perf.py` run PP8 EAGLE3
   and DFlash; the `_dpa_perf.py` variants run the decode at DP8.
+- Decode radix + HiCache on a sliding-window target (`../../pd_decode_swa_hicache.py`):
+  EAGLE3 and DFlash are core's opt-ins; DSpark opts in on this worker (hook on
+  `supports_pd_decode_swa_hicache`), since its draft KV at position i is projected
+  from the target hidden at i. Every DFlash-family draft keeps its KV in the
+  HiCache draft sidecar.
 - KV free fence: commit writes draft KV after the accept outputs the result
   copies, so commit and extend return an output of their last KV write as
   `kv_fence_tail` (MTP's draft hidden, EAGLE3's seed token, the block KV

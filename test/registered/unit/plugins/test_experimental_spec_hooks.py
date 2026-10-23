@@ -486,6 +486,25 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 self.assertTrue(spec_need_hidden_states(lambda: True))
         self.assertEqual(prepared, [batch, "core"])
 
+    def test_experimental_block_drafts_opt_into_the_pd_decode_swa_hicache(self):
+        """DSpark joins DFlash under the PD decode SWA HiCache on the experimental worker."""
+        from sglang_tpu.hooks.experimental_spec import supports_pd_decode_swa_hicache
+
+        def core(algo):
+            return algo.supports_pd_decode_swa_hicache()
+
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            self.assertTrue(
+                supports_pd_decode_swa_hicache(core, SpeculativeAlgorithm.DSPARK)
+            )
+            self.assertTrue(
+                supports_pd_decode_swa_hicache(core, SpeculativeAlgorithm.EAGLE3)
+            )
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            self.assertFalse(
+                supports_pd_decode_swa_hicache(core, SpeculativeAlgorithm.DSPARK)
+            )
+
     def test_host_relayed_draft_state_filters_with_host_indices(self):
         """A PP PD prefill keeps the relayed EAGLE draft state on host; filtering
         it with device indices would compile per batch on the device."""

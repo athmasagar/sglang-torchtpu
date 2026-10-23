@@ -27,6 +27,7 @@ from sglang_tpu.experimental import (
     get_host_batch_padder,
     is_experimental_chain,
     is_experimental_spec,
+    is_experimental_spec_worker,
     uses_host_batch,
 )
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
@@ -352,6 +353,15 @@ def supports_kv_free_fence(original, spec_algorithm, *, copies_draft_tail):
     return original(spec_algorithm, copies_draft_tail=copies_draft_tail)
 
 
+def supports_pd_decode_swa_hicache(original, spec_algorithm):
+    if is_experimental_spec_worker(spec_algorithm):
+        # The block draft's KV at i is projected from the target hidden at i and
+        # written for every prompt and committed token, so unigram radix keys and
+        # the full-anchored draft sidecar cover it; this extends DFlash to DSpark.
+        return True
+    return original(spec_algorithm)
+
+
 def need_topk(original, spec_algorithm):
     # HostPaddedDraftInput carries an empty topk placeholder; an EAGLE topk relay
     # would route it through the EAGLE device-accept resolve.
@@ -418,6 +428,11 @@ def hook_specs():
         (
             "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.supports_kv_free_fence",
             supports_kv_free_fence,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.supports_pd_decode_swa_hicache",
+            supports_pd_decode_swa_hicache,
             HookType.AROUND,
         ),
         (
