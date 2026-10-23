@@ -39,6 +39,7 @@ from torch.compiler._cache import CacheArtifactManager
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.jax_cpu_backend import release_cpu_backend
 from sglang_tpu.page_cache import (
     release_startup_page_cache,
     start_checkpoint_page_cache_release,
@@ -165,6 +166,7 @@ def _before_freeze() -> None:
     CacheArtifactManager.clear()
     # Serving executables are owned by TorchTPU; discard JAX tracing caches.
     jax.clear_caches()
+    release_cpu_backend()
     # gc.freeze() keeps any cycle it sees forever, so collect first even if
     # returning allocator pages is disabled.
     gc.collect()
