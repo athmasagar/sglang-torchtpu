@@ -10,8 +10,8 @@ A flavor is skipped unless it selects on ci-tpu-pool, so non-CI queues are untou
 cpu and memory are derived from the chip count (pods take 4 chips / 4 cpu / 32Gi, so
 1 cpu and 8Gi per chip) to keep TPU the only binding resource.
 
-Fails open: a reconcile that cannot run leaves the existing quota in place and warns,
-rather than blocking the test.
+Any error fails the job: a stale quota admits jobs onto chips that do not exist, or
+leaves live chips idle, and nothing downstream reports either.
 
 Usage: reconcile_quota.py [--dry-run] [--pool=<ci-tpu-pool>]
 """
@@ -231,14 +231,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as e:  # noqa: BLE001 -- stale quota must not block the test
-        # An annotation, not just a log line: a missing grant must show on the run page.
-        print(
-            f"::warning title=TPU quota reconcile skipped::{type(e).__name__}: "
-            f"{' '.join(str(e).split())[:400]}; "
-            "proceeding with existing quota (see kueue-ci-rbac.yaml)"
-        )
+    main()

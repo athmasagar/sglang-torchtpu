@@ -27,9 +27,8 @@ capacity loss the union exists to prevent, so verify with
 the lane's ClusterQueue -- the other half of what used to be a hand edit. Quota is a
 starting value; reconcile_quota.py resets it from live chips before every submission.
 
-Fails open to topology.yaml: no cluster, no kubectl, no RBAC -> today's behaviour. stdout
-carries ONLY the space-separated pool list (the workflow captures it); everything else
-goes to stderr.
+Any error fails the job rather than falling back to topology.yaml. stdout carries ONLY
+the space-separated pool list (the workflow captures it); everything else goes to stderr.
 
 Usage: discover_pools.py --lane nightly --hosts 2 [--sync] [--dry-run]
 """
@@ -141,8 +140,7 @@ def ensure_in_queue(queue, flavor, chips, dry_run):
         (c for c in kget("clusterqueues") if c["metadata"]["name"] == queue), None
     )
     if cq is None:
-        log(f"⚠️  ClusterQueue {queue} not found; flavor {flavor} left unattached")
-        return
+        sys.exit(f"ClusterQueue {queue} not found; cannot attach flavor {flavor}")
     groups, changed = [], False
     for g in cq["spec"].get("resourceGroups", []):
         flavors = list(g.get("flavors", []))
@@ -203,17 +201,12 @@ def main():
     if not static:
         log(f"⚠️  no topology.yaml entry for lane={a.lane} hosts={a.hosts}")
 
-    try:
-        nodes = kget("nodes")
-        if not nodes:
-            raise RuntimeError("no nodes returned")
-        found = {}
-        for lane in lanes:
-            found.update(discover(nodes, lane, a.hosts))
-    except Exception as e:  # noqa: BLE001 -- discovery must never block a test
-        log(f"⚠️  pool discovery skipped ({type(e).__name__}: {e}); using topology.yaml")
-        print(" ".join(static))
-        return
+    nodes = kget("nodes")
+    if not nodes:
+        sys.exit("no nodes returned")
+    found = {}
+    for lane in lanes:
+        found.update(discover(nodes, lane, a.hosts))
 
     # A multi-host pool holding two slices would let a gang straddle them and hang at ICI
     # rendezvous; refuse before that pool reaches a nodeAffinity list.
@@ -224,38 +217,23 @@ def main():
     if new:
         log(f"discovered pools not in topology.yaml: {' '.join(new)}")
     if new and a.sync:
-        # Registering a flavor needs cluster-scoped create on resourceflavors, which the CI
-        # SA may not have. Swallow the failure: an unregistered pool costs one slice of
-        # headroom, a raise here costs the whole test. Loud, because nothing else reports it.
-        try:
-            existing = {
-                f["spec"]["nodeLabels"][POOL_LABEL]: f["metadata"]["name"]
-                for f in kget("resourceflavors")
-                if (f.get("spec") or {}).get("nodeLabels", {}).get(POOL_LABEL)
-            }
-            queues = [
-                topo["lanes"][lane][a.hosts]["queue"]
-                for lane in lanes
-                if topo["lanes"].get(lane, {}).get(a.hosts, {}).get("queue")
-            ]
-            for pool in new:
-                flavor = ensure_flavor(pool, found[pool], existing, a.dry_run)
-                for queue in queues:
-                    # A cohort's split is reconcile_quota.py's to set; start shared pools at 0.
-                    chips = chips_in_pool(nodes, pool) if len(queues) == 1 else 0
-                    ensure_in_queue(queue, flavor, chips, a.dry_run)
-        except Exception as e:  # noqa: BLE001 -- see above
-            detail = getattr(e, "stderr", "") or ""
-            log(
-                f"⚠️  could not register {' '.join(new)} with Kueue "
-                f"({type(e).__name__}: {e}) {detail.strip()[:300]}"
-            )
-            log("⚠️  Kueue will not admit onto those pools until this is fixed.")
-            print(
-                f"::warning title=TPU pool not registered with Kueue::{' '.join(new)} "
-                "(see kueue-ci-rbac.yaml)",
-                file=sys.stderr,
-            )
+        # Needs the cluster-scoped grant in kueue-ci-rbac.yaml.
+        existing = {
+            f["spec"]["nodeLabels"][POOL_LABEL]: f["metadata"]["name"]
+            for f in kget("resourceflavors")
+            if (f.get("spec") or {}).get("nodeLabels", {}).get(POOL_LABEL)
+        }
+        queues = [
+            topo["lanes"][lane][a.hosts]["queue"]
+            for lane in lanes
+            if topo["lanes"].get(lane, {}).get(a.hosts, {}).get("queue")
+        ]
+        for pool in new:
+            flavor = ensure_flavor(pool, found[pool], existing, a.dry_run)
+            for queue in queues:
+                # A cohort's split is reconcile_quota.py's to set; start shared pools at 0.
+                chips = chips_in_pool(nodes, pool) if len(queues) == 1 else 0
+                ensure_in_queue(queue, flavor, chips, a.dry_run)
 
     # Union collapses to `found` once every pool carries ci-tpu-lane -- see the TODO above.
     print(" ".join(sorted(set(static) | set(found))))

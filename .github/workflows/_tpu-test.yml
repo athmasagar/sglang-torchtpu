@@ -173,7 +173,7 @@ jobs:
           # Resolve pools before rendering, because the pod's nodeAffinity is baked in at
           # render time. Unions topology.yaml's list with any pool labelled
           # ci-tpu-lane=<lane> of this slice shape, and registers a new pool's Kueue flavor,
-          # so adding a slice needs no code change. Fails open to topology.yaml.
+          # so adding a slice needs no code change. Any error fails the job.
           pools="$(python3 .github/tpu-ci/discover_pools.py \
                      --lane "$IN_LANE" --hosts "$IN_HOSTS" --sync)"
           echo "pools for lane=${IN_LANE} hosts=${IN_HOSTS}: ${pools}"
@@ -201,8 +201,8 @@ jobs:
           echo "== rendered (key fields) =="
           grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head
           # Quota tracks live capacity, checked here rather than on a timer: it only has to
-          # be right at the moment admission is decided. Fails open -- a stale quota is
-          # survivable (waitForPodsReady evicts and requeues), a blocked test is not.
+          # be right at the moment admission is decided. Any error fails the job: a stale
+          # quota admits onto chips that do not exist, or leaves live chips idle.
           # A (lane, hosts) can own several interchangeable slices, so reconcile each of its
           # pools: --pool drives the one-slice-per-pool guard, and a resized multi-host pool
           # must fail the job that would have straddled it.

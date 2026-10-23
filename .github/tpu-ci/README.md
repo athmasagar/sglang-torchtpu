@@ -476,9 +476,8 @@ kubectl auth can-i patch clusterqueues/tpu-prgate-1h \
 ```
 
 Without `kueue-ci-rbac.yaml` the CI service account can read the queues but not patch them,
-so `reconcile_quota.py` and `discover_pools.py --sync` log a `::warning::` on every job and
-the quotas stay whatever was last applied by hand -- wrong as soon as a pool is resized,
-added or deleted.
+so `reconcile_quota.py` and `discover_pools.py --sync` fail every CI job with `Forbidden`.
+Apply it before merging any change that runs them.
 
 `ACTIVE=True` is necessary but not sufficient. A queue is Active as soon as its flavors
 resolve, even if it can never admit anything — so also check that a real workload reaches
