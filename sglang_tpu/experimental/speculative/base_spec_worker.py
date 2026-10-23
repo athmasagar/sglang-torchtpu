@@ -449,12 +449,19 @@ class TpuSpecWorker(BaseSpecWorker):
 
     @abstractmethod
     def make_verify_input(
-        self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
+        self,
+        *,
+        batch: ScheduleBatch,
+        verify_tokens: torch.Tensor,
+        rows: VerifyRows,
+        draft_result: DraftResult | None = None,
     ) -> SpecInput:
         """The algorithm's own TARGET_VERIFY spec_info for [pbs * (N + 1)] verify rows.
 
         Why: attention backends and the dynamo tracer key on the algorithm's
         verify type; its compile policy must warm the same structure.
+        draft_result carries this step's proposals and probabilities; idle
+        ranks that only mirror the target forward leave it None.
         Noop: never.
         """
 
@@ -484,12 +491,19 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens = build_verify_tokens(
                 bucket.state.bonus_tokens, draft_result.draft_tokens
             )
+        spec_info = self.make_verify_input(
+            batch=batch,
+            verify_tokens=verify_tokens,
+            rows=rows,
+            draft_result=draft_result,
+        )
         logits_output = self._forward_target_verify(
             batch=batch,
             bucket_state=bucket.state,
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=spec_info,
         )
         target_logits = logits_output.next_token_logits
         assert target_logits.shape[0] == draft_result.draft_tokens.shape[0] * (
@@ -840,6 +854,9 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=self.make_verify_input(
+                batch=batch, verify_tokens=verify_tokens, rows=rows
+            ),
         )
         site = SpecTpSyncSite.SPEC_ACCEPT_GREEDY
         padded_bs = state.seq_lens.shape[0]
@@ -1221,11 +1238,9 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        spec_info: SpecInput,
     ) -> ForwardBatch:
         """TARGET_VERIFY ForwardBatch already at the [pbs, N + 1] bucket; the shim pads nothing."""
-        spec_info = self.make_verify_input(
-            batch=batch, verify_tokens=verify_tokens, rows=rows
-        )
         batch.out_cache_loc = rows.flat_cache_locs
         with self._bucket_view(
             batch,
@@ -1277,6 +1292,7 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        spec_info: SpecInput,
     ) -> LogitsProcessorOutput:
         verify_forward_batch = self._build_verify_batch(
             batch=batch,
@@ -1284,6 +1300,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=spec_info,
         )
         # Keep logits/hidden on the batch bucket so the compiled accept op needs no re-pad.
         assert verify_forward_batch.spec_info is not None
