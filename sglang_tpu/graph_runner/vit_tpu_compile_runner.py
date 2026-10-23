@@ -217,19 +217,24 @@ class VisionTpuCompilePolicy(CompilePolicy):
                     direct_compile,
                 )
 
+                # Rank-dependent values (dist.get_rank(), EP expert windows)
+                # are only lifted to tensor inputs when the TP group is the
+                # whole world; without the lift the graphs differ per rank, so
+                # cross-rank sharing must stay off even for spmd_safe policies.
+                lift_rank = (
+                    torch.distributed.is_initialized()
+                    and get_parallel().tp_group.world_size
+                    == torch.distributed.get_world_size()
+                )
                 return direct_compile(
                     torch.no_grad()(method),
                     name=self.name,
-                    spmd_safe=self.spmd_safe,
+                    spmd_safe=self.spmd_safe and lift_rank,
                     specialization_key=lambda *args: tuple(
                         (tuple(t.shape), t.dtype) for t in args
                     ),
                     model=model,
-                    lift_rank=(
-                        torch.distributed.is_initialized()
-                        and get_parallel().tp_group.world_size
-                        == torch.distributed.get_world_size()
-                    ),
+                    lift_rank=lift_rank,
                 )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
         return compiler(
@@ -477,7 +482,16 @@ class _Qwen3VLRunContext:
 
 
 class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
-    """Compile policy for compiled Qwen3-VL ViT blocks."""
+    """Compile policy for compiled Qwen3-VL ViT blocks.
+
+    ``spmd_safe``: the ViT is replicated and its only rank-dependent value
+    (``dist.get_rank()`` in the attention path) is lifted by ``lift_rank``.
+    Verified with ``VERIFY_SPMD_SAFE=1`` on the Qwen3-VL-30B-A3B recipes
+    (#1623); re-verify before enabling ``--use-spmd-compile`` for another
+    model that reuses this policy.
+    """
+
+    spmd_safe = True
 
     def __init__(
         self, vit: Any | None = None, *, name: str = "qwen3_vl_vit_encoder", **kwargs
