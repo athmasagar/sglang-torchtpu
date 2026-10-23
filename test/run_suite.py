@@ -253,10 +253,14 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-gemma4-26b-a4b-gpqa",
         "nightly-tpu-accuracy-gemma4-26b-a4b-mmmupro",
         "nightly-tpu-accuracy-qwen3-5-397b-mmmupro",
+        "nightly-tpu-accuracy-qwen3-8-27b-gpqa",
+        "nightly-tpu-accuracy-qwen3-8-27b-aime",
+        "nightly-tpu-accuracy-qwen3-8-27b-mmmupro",
         "nightly-tpu-accuracy-gpt-oss-120b-aime",
         "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
         "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
         "nightly-tpu-accuracy-gpt-oss-120b-mmlupro",
+        "nightly-tpu-accuracy-glm-5-3-flash-aime",
         # External tpu7x cluster (nightly-test-external-tpu.yml; see
         # .github/tpu-ci/external/README.md). 1host: single-host tests that launch
         # their own server. 2x2x2 / 2x2x4: multi-host jobs wired by hand in

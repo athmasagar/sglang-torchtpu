@@ -2,8 +2,9 @@
 
 The serving settings are the ones the single-host MMMU-Pro gate launches through
 recipe/qwen3_vl_30b_a3b/server.sh. Keep the two in sync: the P/D gate is meant
-to differ from the single-host gate only in the disaggregated handoff. Only
-model locations, service ports, and readiness budgets come from the deployment
+to differ from the single-host gate only in the disaggregated handoff -- the
+sampler, the warmup skip, and the disaggregation_* settings below. Only model
+locations, service ports, and readiness budgets come from the deployment
 environment.
 """
 
@@ -53,6 +54,9 @@ _COMMON_CONFIG = {
         "mm_process_config": MM_PROCESS_CONFIG,
         # The ViT and decoder graph captures outlast the 300s default.
         "watchdog_timeout": 3600,
+        # As in the single-host recipe: direct tracing compiles the ViT and
+        # decoder warmups concurrently instead of one after another.
+        "tpu_compile_tracer": "direct",
         # The sampler every TPU P/D gate pins (pd_reshard_harness.py notes the
         # distributed top-k crash behind it). Greedy decoding picks the argmax
         # token with either sampler.

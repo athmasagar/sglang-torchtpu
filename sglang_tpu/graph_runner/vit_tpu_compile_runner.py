@@ -19,6 +19,7 @@ from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
+from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.patches import _register_tpu_compile_backend
 
@@ -218,10 +219,17 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
                 return direct_compile(
                     torch.no_grad()(method),
+                    name=self.name,
+                    spmd_safe=self.spmd_safe,
                     specialization_key=lambda *args: tuple(
                         (tuple(t.shape), t.dtype) for t in args
                     ),
                     model=model,
+                    lift_rank=(
+                        torch.distributed.is_initialized()
+                        and get_parallel().tp_group.world_size
+                        == torch.distributed.get_world_size()
+                    ),
                 )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
         return compiler(
@@ -524,7 +532,19 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
             max_patches=envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get(),
         )
 
-    def warmup_once(self, patch_count: int) -> None:
+    def get_compile_model(self) -> torch.nn.Module | None:
+        # The compiled boundary (ViTTpuCompileRunner.forward) reads the blocks,
+        # merger and deepstack mergers, all registered submodules of the vision
+        # tower. Supplying it opts this encoder into native async direct
+        # compilation under --tpu-compile-tracer direct, so the bucket ladder
+        # compiles concurrently instead of one bucket at a time.
+        return self.vit if isinstance(self.vit, torch.nn.Module) else None
+
+    def warmup_once(self, patch_count: int) -> PendingCall | None:
+        from sglang_tpu.compilation.direct_compile import (
+            CompiledFunction,
+        )
+
         # A square grid lands exactly on the bucket, so the eager prologue and
         # epilogue warm at the shapes a real image of this bucket will use.
         vit = self.vit
@@ -535,10 +555,19 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
             * patch_embed.patch_size**2
         )
         grid = int(math.isqrt(patch_count))
-        vit.forward_with_tpu_graph(
-            torch.zeros(patch_count, in_features, dtype=vit.dtype),
-            torch.tensor([[1, grid, grid]], dtype=torch.int32),
-        )
+        x = torch.zeros(patch_count, in_features, dtype=vit.dtype)
+        grid_thw = torch.tensor([[1, grid, grid]], dtype=torch.int32)
+        if not isinstance(self.compiled_fn, CompiledFunction):
+            vit.forward_with_tpu_graph(x, grid_thw)
+            return None
+
+        # Direct compile: run the eager prologue now, then submit the compiled
+        # boundary with the exact argument tuple run() passes at serve time so
+        # the specialization is reused. unpad_outputs is skipped: a square grid
+        # is never trimmed, so the synchronous path does not warm it either.
+        x, cu_seqlens, cos, sin = vit.prepare_tpu_graph_inputs(x, grid_thw)
+        args, _ = self.prepare_call(x.unsqueeze(1), cu_seqlens, cos, sin)
+        return self.compiled_fn.warmup_async(*args).then(self._sync_warmup)
 
     def prepare_call(
         self,
@@ -707,6 +736,11 @@ class ViTTpuCompileRunner:
         compile annotation convention used by the decoder.
         """
         vit = self.vit
+        # The vision blocks add their residuals in place (``x += attn``). Work
+        # on a copy so the compiled region never mutates its input: Dynamo
+        # functionalizes that, but direct_compile only allows mutation through
+        # its KV pool and aborts when an input placeholder carries deferred ops.
+        x = x.clone()
         deepstack_features = []
         num_deepstack = 0
 

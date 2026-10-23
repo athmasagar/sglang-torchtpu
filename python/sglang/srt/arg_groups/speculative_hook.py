@@ -92,7 +92,11 @@ def _validate_tpu_speculative_args(server_args: ServerArgs, model_config) -> Non
     if cfg.kv_canary != "none":
         raise ValueError("TPU speculative decoding does not support KV canary.")
     if getattr(model_config.hf_config, "index_share_for_mtp_iteration", False):
-        raise ValueError("TPU speculative decoding does not support DSA index sharing.")
+        raise ValueError(
+            "TPU speculative decoding does not support DSA index sharing. A NextN "
+            "draft with its own indexer can run without it: pass "
+            "--json-model-override-args with index_share_for_mtp_iteration=false."
+        )
 
 
 def _resolve_speculative_algorithm_alias(
@@ -291,16 +295,22 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if attn_dp_enabled_of(cfg) and not cfg.device == "npu":
+    # DFLASH + dp attention is validated on NPU, and on platforms that opt in.
+    if (
+        attn_dp_enabled_of(cfg)
+        and not cfg.device == "npu"
+        and not current_platform.supports_speculative_dp_attention(algorithm)
+    ):
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp "
             "attention on non-NPU devices."
         )
 
-    if cfg.pp_size != 1:
+    # check_pipeline_parallel_compat decides which platforms serve a DFLASH PP prefill.
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "DFLASH pipeline parallelism requires PD prefill; "
+            "decode and non-disaggregated serving require pp_size == 1."
         )
 
     if cfg.speculative_draft_model_path is None:
@@ -604,9 +614,9 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu")):
+    if not cfg.device.startswith(("cuda", "npu", "tpu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA or NPU device."
+            "DSpark speculative decoding only supports CUDA, NPU, or TPU device."
         )
 
     if cfg.attn_dp_size > 1:

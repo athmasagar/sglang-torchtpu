@@ -17,8 +17,10 @@ warmup_buckets.py    # request-sender used by warmup.sh
 ## Usage
 
 The Python launcher (`python -m benchmark.tpu.launch_server --config ...`)
-preserves hardware metadata such as `TPU_TOPOLOGY`. For one-host-per-engine P/D,
-it removes cross-host rendezvous settings so each engine initializes locally.
+runs a per-model recipe; [`recipe/README.md`](recipe/README.md) is the index of
+them and the config format. It preserves hardware metadata such as
+`TPU_TOPOLOGY`. For one-host-per-engine P/D, it removes cross-host rendezvous
+settings so each engine initializes locally.
 The shared serving recipes include the shell launcher's diagnostic, telemetry,
 recompilation logging, and online Hugging Face defaults. Override them with
 `--runtime-envs`, for example `'{"HF_HUB_OFFLINE":"1","TRANSFORMERS_OFFLINE":"1"}'`.
@@ -28,7 +30,11 @@ cache to `torchtpu_<model-slug>` and tier-3 to
 `$HOME/.cache/torch_tpu_compile_cache`, with local backup enabled. Explicit
 `TORCH_TPU_INTERNAL_TIER*` settings take precedence; `runtime_envs` entries set
 to `null` remove those variables. `ENABLE_COMPILE_CACHE=0` suppresses the cache
-defaults. Cache directories are created only for a real launch, not a dry-run.
+defaults and sets `TORCH_TPU_TIER2_COMPILATION_CACHE=disabled` (unless already
+set): with no tier-2 name, torch_tpu otherwise falls back to an implicit
+`/dev/shm/torch_tpu_cache/default` tier-2 cache whenever `WORLD_SIZE > 1`.
+Both launchers behave the same way. Cache directories are created only for a
+real launch, not a dry-run.
 
 Run launch and bench in separate shells; set `MODEL` for both.
 
