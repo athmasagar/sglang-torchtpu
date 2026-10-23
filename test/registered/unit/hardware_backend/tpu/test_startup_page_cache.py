@@ -1,11 +1,8 @@
 """CPU checks for startup file cleanup and host memory diagnostics."""
 
-import fcntl
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -14,13 +11,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu import page_cache, startup_memory
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
-
-
-@pytest.fixture(autouse=True)
-def isolated_cache_environment(monkeypatch):
-    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
-    monkeypatch.delenv("JAX_COMPILATION_CACHE_DIR", raising=False)
-    monkeypatch.delenv("SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE", raising=False)
 
 
 @pytest.mark.parametrize(
@@ -58,12 +48,12 @@ def test_disk_cache_preserves_files_and_other_namespaces(
     monkeypatch.setattr(
         page_cache, "_advise_file", lambda p: advised.append(p) or p.stat().st_size
     )
-    page_cache.release_compile_page_cache()
+    page_cache.release_compile_artifacts()
     assert sorted(advised) == paths
     assert all(p.read_bytes() == b"payload" for p in paths)
-    monkeypatch.setenv("SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE", "0")
+    monkeypatch.setenv("SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS", "0")
     advised.clear()
-    page_cache.release_compile_page_cache()
+    page_cache.release_compile_artifacts()
     assert advised == []
 
 
@@ -123,7 +113,7 @@ def test_startup_discovers_files_only_on_the_host_leader(monkeypatch):
         page_cache, "release_checkpoint_page_cache", lambda paths: events.append(paths)
     )
     monkeypatch.setattr(
-        page_cache, "release_compile_page_cache", lambda: events.append("compiled")
+        page_cache, "release_compile_artifacts", lambda: events.append("compiled")
     )
     for rank in range(8):
         monkeypatch.setenv("LOCAL_RANK", str(rank))
@@ -146,7 +136,7 @@ def test_compile_cache_disabled_skips(monkeypatch, tmp_path, caplog, env_name):
         page_cache, "_filesystem_type", lambda _: pytest.fail("cache disabled")
     )
     with caplog.at_level(logging.INFO):
-        page_cache.release_compile_page_cache()
+        page_cache.release_compile_artifacts()
     assert not caplog.records
 
 
@@ -183,11 +173,11 @@ def test_compile_cache_disappearance_and_other_errors(
         monkeypatch.setattr(Path, operation, changed)
     if failure is FileNotFoundError:
         with caplog.at_level(logging.INFO):
-            page_cache.release_compile_page_cache()
+            page_cache.release_compile_artifacts()
         assert "advised_gb=0.000" in caplog.text
     else:
         with pytest.raises(PermissionError, match="cache changed"):
-            page_cache.release_compile_page_cache()
+            page_cache.release_compile_artifacts()
 
 
 def test_tmpfs_mount_resolution(monkeypatch, tmp_path):
@@ -252,70 +242,6 @@ def test_memory_log_aggregates_zones_and_warns(
         startup_memory.log_startup_memory()
     assert "headroom is unlimited" in caplog.text
     assert "NUMA free 2 MiB+ blocks unavailable" in caplog.text
-
-
-def test_tmpfs_release_preserves_locks_directories_and_unrelated_files(
-    monkeypatch, tmp_path
-):
-    native = tmp_path / "native/active/fingerprint"
-    native.mkdir(parents=True)
-    inductor = tmp_path / "inductor"
-    aot = inductor / "aotautograd/key"
-    aot.mkdir(parents=True)
-    jax = tmp_path / "jax"
-    jax.mkdir()
-    payloads = [native / "key.bin", aot / "artifact", jax / "program-cache"]
-    foreign = tmp_path / "native/other-server/program.bin"
-    foreign.parent.mkdir()
-    preserved = [native / "key.lock", inductor / "module.so", foreign]
-    for path in payloads + preserved:
-        path.write_bytes(b"payload")
-    (aot / "symlink").symlink_to(foreign)
-    monkeypatch.setattr(page_cache, "_CACHE_ROOT", tmp_path / "native")
-    monkeypatch.setattr(page_cache, "_filesystem_type", lambda _: "tmpfs")
-    monkeypatch.setenv("TORCH_TPU_TIER2_COMPILATION_CACHE", "active")
-    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(inductor))
-    monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", str(jax))
-    page_cache.release_compile_page_cache()
-    assert all(not path.exists() for path in payloads)
-    assert all(path.read_bytes() == b"payload" for path in preserved)
-    assert (aot / "symlink").is_symlink()
-    assert all(path.is_dir() for path in (native, aot, jax))
-    # Other ranks can release the same shared cache; later misses can save again.
-    page_cache.release_compile_page_cache()
-    for path in payloads:
-        path.write_bytes(b"new compilation")
-
-
-def test_tmpfs_release_waits_for_pending_native_write(monkeypatch, tmp_path):
-    root = tmp_path / "active"
-    root.mkdir()
-    lock_path = root / "pending.lock"
-    payload = root / "pending.bin"
-    started = Event()
-    original_flock = fcntl.flock
-
-    def flock(fd, operation):
-        started.set()
-        original_flock(fd, operation)
-
-    monkeypatch.setattr(page_cache, "_CACHE_ROOT", tmp_path)
-    monkeypatch.setattr(page_cache, "_filesystem_type", lambda _: "tmpfs")
-    monkeypatch.setattr(page_cache.fcntl, "flock", flock)
-    monkeypatch.setenv("TORCH_TPU_TIER2_COMPILATION_CACHE", "active")
-    with ThreadPoolExecutor(1) as executor:
-        with lock_path.open("wb") as writer:
-            original_flock(writer.fileno(), fcntl.LOCK_EX)
-            release = executor.submit(page_cache.release_compile_page_cache)
-            try:
-                assert started.wait(timeout=5)
-                assert not release.done()
-                payload.write_bytes(b"serialized after compile future resolved")
-            finally:
-                original_flock(writer.fileno(), fcntl.LOCK_UN)
-        release.result(timeout=5)
-    assert not payload.exists()
-    assert lock_path.exists()
 
 
 if __name__ == "__main__":

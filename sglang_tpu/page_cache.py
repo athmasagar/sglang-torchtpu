@@ -167,8 +167,8 @@ def _release_native_cache() -> None:
     )
 
 
-def release_compile_page_cache() -> None:
-    if not envs.SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE.get():
+def release_compile_artifacts() -> None:
+    if not envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.get():
         return
     _release_native_cache()
     # Only serialized TorchTPU/AOT and JAX caches are disposable. Inductor can
@@ -193,4 +193,4 @@ def release_startup_page_cache() -> None:
     if draft_path := get_spec().speculative_draft_model_path:
         model_paths.append(draft_path)
     release_checkpoint_page_cache(model_paths)
-    release_compile_page_cache()
+    release_compile_artifacts()

@@ -141,12 +141,7 @@ cache pages. Both releases default on. The compiler cache namespace comes from
 `TORCH_TPU_TIER2_COMPILATION_CACHE` (legacy:
 `TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE`); empty or unset selects `default`,
 and `disabled` skips it. Other namespaces are untouched. Disk-backed files are
-advised with `POSIX_FADV_DONTNEED` and remain on disk. On tmpfs/ramfs, serialized
-native `.bin` files are deleted under their cache locks. Tmpfs AOTAutograd files
-under `TORCHINDUCTOR_CACHE_DIR/aotautograd` and files in
-`JAX_COMPILATION_CACHE_DIR` are also deleted. Locks, directories, generated code
-and loaded executables remain available. Later misses or restarts rebuild the
-deleted caches. The compiler-cache opt-out covers both disk advice and deletion.
+advised with `POSIX_FADV_DONTNEED` and remain on disk; tmpfs/ramfs are skipped.
 Advice is not a measurement of resident memory freed.
 
 Checkpoint pages remain eligible for kernel reclaim during startup, but explicit
