@@ -66,12 +66,16 @@ class SafetensorsMmapReader:
             with safe_open(
                 path, framework="pt", device="cpu" if read_on_host else device
             ) as handle:
+                moved_to = None
                 for name in handle.keys():  # noqa: SIM118
                     if key_filter is not None and not key_filter(name):
                         continue
                     tensor = handle.get_tensor(name)
-                    yield name, tensor.to(device) if read_on_host else tensor
-                if read_on_host and torch.device(device).type != "cpu":
+                    if read_on_host:
+                        tensor = tensor.to(device)
+                        moved_to = tensor.device
+                    yield name, tensor
+                if moved_to is not None and moved_to.type != "cpu":
                     # The host tensors are views into the mapping, which closes
-                    # with this block: finish any host-to-device copy first.
+                    # with this block: finish the host-to-device copies first.
                     torch.accelerator.synchronize()

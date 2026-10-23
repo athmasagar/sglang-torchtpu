@@ -104,8 +104,8 @@ def _check_head_dim2_output_exchange(usp, rank, world):
     """Heads-major output (an attention kernel's [b, h, s, d] result viewed as
     [b, s, h, d], more than one local head) is exchanged in head slabs where
     the platform prefers it (TPU); any other layout or platform takes the
-    sequence-major relayout. Both return bit-identical values in a fresh
-    contiguous tensor."""
+    sequence-major relayout. Both return bit-identical values in a contiguous
+    tensor; the head-slab result is always a fresh one."""
     exchange = usp._usp_all_to_all_single
     exchanged_ndims = []
 
@@ -159,6 +159,10 @@ def _check_head_dim2_output_exchange(usp, rank, world):
             assert exchanged_ndims == [5 if head_slabs else 4], case
             torch.testing.assert_close(out, local, rtol=0, atol=0, msg=case)
             assert out.is_contiguous(), case
+            if not head_slabs and batch == local_seq == 1:
+                # The sequence-major merge is a no-op permute here, so its
+                # result is the staging buffer itself, as on main.
+                continue
             kept = out.clone()
             usp._usp_output_all_to_all(x + 1, head_dim=2)
             torch.testing.assert_close(out, kept, rtol=0, atol=0, msg=case)
