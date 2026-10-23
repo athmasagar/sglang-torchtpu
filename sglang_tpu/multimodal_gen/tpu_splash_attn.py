@@ -31,6 +31,8 @@ NUM_SUBLANES = 8
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))
 # Finite stand-in for -inf scores: exp2 of it is 0 without inf - inf.
 _MASK_VALUE = -0.7 * float(np.finfo(np.float32).max)
+# The kernels mask raw scores with _MASK_VALUE before scaling: for a scale
+# above ~1.43 the product overflows to -inf, which exp2 still maps to 0.
 # Block sizes and the VMEM model below are tuned and validated on v7x only.
 _SUPPORTED_PALLAS_DEVICE_KINDS = frozenset({"TPU7x"})
 
@@ -336,7 +338,8 @@ def _flash_call(
                 update(pl.ds(full * block_kv_compute, tail))
 
         if runtime_kv:
-            real_keys = kv_info_ref[1]
+            # A count past the array would read stale VMEM rows unmasked.
+            real_keys = jnp.minimum(kv_info_ref[1], kv_seq)
             start = j * block_kv
 
             @pl.when(start + block_kv <= real_keys)
@@ -397,7 +400,13 @@ def _flash_call(
 
     def kv_index(h, i, j, *scalars):
         row = (h // heads) * kv_heads + (h % heads) // q_heads_per_kv_head
-        return (row + scalars[0][0] if scalars else row, j, 0)
+        if not scalars:
+            return (row, j, 0)
+        # Blocks past the last real key skip compute; repeating the last real
+        # block's index there lets the pipeline skip their K/V copies too.
+        real = jnp.minimum(scalars[0][1], kv_seq)
+        last = jnp.maximum((real + block_kv - 1) // block_kv - 1, 0)
+        return (row + scalars[0][0], jnp.minimum(j, last), 0)
 
     def lse_index(h, i, j, *_):
         return (h, 0, i)
@@ -773,6 +782,11 @@ def _ring_kernel_fallback_reason(
 _REFERENCE_SCORE_BYTES = 256 << 20
 
 
+def _reference_chunk_rows(query: torch.Tensor, key: torch.Tensor) -> int:
+    batch, heads, kv_seq = query.shape[0], query.shape[1], key.shape[2]
+    return max(1, _REFERENCE_SCORE_BYTES // (4 * batch * heads * max(kv_seq, 1)))
+
+
 def _attention_with_lse_reference(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -798,7 +812,7 @@ def _attention_with_lse_reference(
         real = cols < real_keys
         # Keys past the real count may hold NaN; they must add nothing.
         value = torch.where(real[:, None], value, 0.0)
-    chunk = max(1, _REFERENCE_SCORE_BYTES // (4 * batch * heads * max(kv_seq, 1)))
+    chunk = _reference_chunk_rows(query, key)
     outs, lses = [], []
     for start in range(0, q_seq, chunk):
         scores = torch.matmul(query[:, :, start : start + chunk].float(), key_t) * scale
@@ -873,9 +887,16 @@ def tpu_ring_attention_step(
     Steps carry the float32 partial output and its log-sum-exp (base 2 from
     the kernel; natural log from the reference, which serves the shapes the
     kernel does not take), so only the returned output is rounded to the
-    query dtype.
+    query dtype. The carry layouts differ by path, chosen statically from the
+    shapes: kernel ``(out [B, H, S, D], lse [B, H, NUM_SUBLANES, S])`` with
+    identical sublane rows, reference ``(out, lse [B, H, S])``.
     """
-    if _ring_kernel_fallback_reason(query, key, value) is None:
+    assert kv_info.dtype == torch.int32 and tuple(kv_info.shape) == (2,), (
+        f"kv_info must be int32 [row offset, real keys], got "
+        f"{kv_info.dtype} {tuple(kv_info.shape)}"
+    )
+    reason = _ring_kernel_fallback_reason(query, key, value)
+    if reason is None:
         _register_ops()
         out_prev, lse_prev = carry if carry is not None else (None, None)
         out, lse2 = _FLASH_RING_OP(
@@ -888,6 +909,18 @@ def tpu_ring_attention_step(
             scale,
         )
         return out.to(query.dtype), (out, lse2)
+    log_key = ("ring", query.shape[2], key.shape[2], reason)
+    # Logging breaks a torch.compile graph; eager runs report the fallback.
+    if not torch.compiler.is_compiling() and log_key not in _logged_sdpa_fallbacks:
+        _logged_sdpa_fallbacks.add(log_key)
+        logger.info(
+            "TPU ring attention step: q_seq=%d kv_seq=%d -> float32 reference "
+            "(%s); %d query chunks per step.",
+            query.shape[2],
+            key.shape[2],
+            reason,
+            -(-query.shape[2] // _reference_chunk_rows(query, key)),
+        )
     # Same shard selection as the kernel's index map, as device data.
     batch, kv_heads = query.shape[0], key.shape[1]
     rows = kv_info[0] + torch.arange(batch * kv_heads, device=key.device)
@@ -908,10 +941,6 @@ class TpuSplashAttentionBackend(SDPABackend):
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.TPU_SPLASH_ATTN
-
-    @classmethod
-    def supports_ring_rotation(cls) -> bool:
-        return True
 
     @staticmethod
     def get_impl_cls() -> type["TpuSplashAttentionImpl"]:
@@ -972,6 +1001,15 @@ class TpuSplashAttentionImpl(SDPAImpl):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if return_softmax_lse:
             # [b, s, h, d] output and [b, h, s] natural-log LSE.
+            if not self.use_splash or query.device.type != "tpu":
+                output, lse = _attention_with_lse_reference(
+                    query.transpose(1, 2),
+                    key.transpose(1, 2),
+                    value.transpose(1, 2),
+                    self.softmax_scale,
+                    is_causal=self.causal,
+                )
+                return output.to(query.dtype).transpose(1, 2), lse
             output, lse = tpu_attention_with_lse(
                 query.transpose(1, 2),
                 key.transpose(1, 2),
@@ -1006,6 +1044,9 @@ class TpuSplashAttentionImpl(SDPAImpl):
         kv_info: torch.Tensor,
         carry: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        # carry = (float32 partial output, log-sum-exp); its layout depends on
+        # whether the kernel or the reference ran (tpu_ring_attention_step).
+        # Treat it as opaque.
         if self.causal:
             raise NotImplementedError("the all-gather ring is non-causal only")
         return tpu_ring_attention_step(
