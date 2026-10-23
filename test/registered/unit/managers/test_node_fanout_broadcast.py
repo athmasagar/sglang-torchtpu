@@ -137,7 +137,9 @@ def _run_rank(rank: int, init_file: str) -> None:
                 "sglang.srt.managers.mm_utils.get_serving",
                 return_value=SimpleNamespace(skip_tokenizer_init=False),
             ),
-            patch.dict(os.environ, {"SGLANG_NODE_FANOUT_REQ_BROADCAST": "1"}),
+            patch.dict(
+                os.environ, {"SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST": "1"}
+            ),
         ):
             _exercise_receiver(rank, receiver)
     finally:
@@ -178,7 +180,7 @@ def _exercise_receiver(rank, receiver):
         _check_mixed_requests(rank, receiver, 110 + 10 * index)
 
     # The opt-out continues to use the flat broadcast.
-    with patch.dict(os.environ, {"SGLANG_NODE_FANOUT_REQ_BROADCAST": "0"}):
+    with patch.dict(os.environ, {"SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST": "0"}):
         reqs = receiver._broadcast_reqs_across_ranks(
             [_request("text-only", None)] if rank == 0 else None
         )
@@ -367,18 +369,22 @@ def _assert_unlinked(names):
 
 class TestNodeFanoutBroadcast(unittest.TestCase):
     def test_transport_eligibility(self):
+        node_fanout.print_warning_once.cache_clear()
+        self.addCleanup(node_fanout.print_warning_once.cache_clear)
         cases = [
-            ({}, False, None, False),
-            ({}, False, "0", False),
-            ({}, False, "1", True),
-            ({"nnodes": 1}, False, "1", False),
-            ({"tp_size": 1}, False, "1", False),
-            ({"pp_size": 2}, False, "1", False),
-            ({"tp_size": 3}, False, "1", False),
-            ({"attn_dp_enabled": True}, False, "1", False),
-            ({}, True, "1", False),
+            ({}, False, None, False, None),
+            ({}, False, "0", False, None),
+            ({}, False, "1", True, None),
+            ({"nnodes": 1}, False, "1", False, "nnodes > 1"),
+            ({"tp_size": 1}, False, "1", False, "tp_size > 1"),
+            ({"pp_size": 2}, False, "1", False, "pp_size == 1"),
+            ({"tp_size": 3}, False, "1", False, "divisible by nnodes"),
+            ({"attn_dp_enabled": True}, False, "1", False, "DP attention"),
+            ({}, True, "1", False, "tokenizer initialization"),
+            # A prior rejected configuration must not cache the decision.
+            ({}, False, "1", True, None),
         ]
-        for overrides, skip_tokenizer, flag, expected in cases:
+        for overrides, skip_tokenizer, flag, expected, reason in cases:
             with self.subTest(
                 overrides=overrides, skip_tokenizer=skip_tokenizer, flag=flag
             ):
@@ -396,12 +402,78 @@ class TestNodeFanoutBroadcast(unittest.TestCase):
                             skip_tokenizer_init=skip_tokenizer
                         ),
                     ),
+                    patch("sglang.srt.utils.common.logger.warning") as warning,
                 ):
                     if flag is None:
-                        os.environ.pop("SGLANG_NODE_FANOUT_REQ_BROADCAST", None)
+                        os.environ.pop(
+                            "SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST", None
+                        )
                     else:
-                        os.environ["SGLANG_NODE_FANOUT_REQ_BROADCAST"] = flag
-                    self.assertEqual(node_fanout_enabled(), expected)
+                        os.environ["SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST"] = flag
+                    for _ in range(2):
+                        self.assertEqual(node_fanout_enabled(), expected)
+                    if reason is None:
+                        warning.assert_not_called()
+                    else:
+                        warning.assert_called_once()
+                        message = warning.call_args.args[0]
+                        self.assertIn(
+                            "SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST", message
+                        )
+                        self.assertIn(reason, message)
+
+    def test_disabled_flag_does_not_require_runtime_context(self):
+        with (
+            patch.dict(
+                os.environ, {"SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST": "0"}
+            ),
+            patch.object(node_fanout, "get_parallel") as parallel,
+            patch.object(node_fanout, "get_serving") as serving,
+        ):
+            self.assertFalse(node_fanout_enabled())
+            parallel.assert_not_called()
+            serving.assert_not_called()
+
+    def test_ineligible_dispatch_warns_without_creating_groups(self):
+        node_fanout.print_warning_once.cache_clear()
+        self.addCleanup(node_fanout.print_warning_once.cache_clear)
+        for attn_dp in (False, True):
+            with self.subTest(attn_dp=attn_dp):
+                parallel = SimpleNamespace(
+                    nnodes=2,
+                    tp_size=4 if attn_dp else 1,
+                    pp_size=1,
+                    attn_dp_enabled=attn_dp,
+                    attn_tp_rank=0,
+                    attn_cp_rank=0,
+                    enable_dp_attention_local_control_broadcast=True,
+                )
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST": "1"},
+                    ),
+                    patch.object(node_fanout, "get_parallel", return_value=parallel),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                        return_value=parallel,
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.request_receiver.attn_cp_tp_broadcast_pyobj",
+                        side_effect=lambda reqs: reqs,
+                    ),
+                    patch.object(node_fanout.dist, "new_group") as new_group,
+                    patch("sglang.srt.utils.common.logger.warning") as warning,
+                ):
+                    receiver = _receiver()
+                    for _ in range(2):
+                        self.assertEqual(receiver._broadcast_reqs_across_ranks([]), [])
+                    warning.assert_called_once()
+                    self.assertIn(
+                        "DP attention" if attn_dp else "tp_size > 1",
+                        warning.call_args.args[0],
+                    )
+                    new_group.assert_not_called()
 
     def test_segment_creation_failure_is_recoverable(self):
         with patch.object(

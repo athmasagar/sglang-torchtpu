@@ -171,6 +171,8 @@ class SchedulerRequestReceiver:
         sharing one waiting queue; the control channel fans out from global
         rank 0 and would overwrite every DP group's aborts but the first.
         """
+        # Check before branching so unsupported TP1/DP configurations also warn.
+        use_node_fanout = node_fanout_enabled()
         local_reqs = local_reqs or []
         if get_parallel().attn_dp_enabled:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
@@ -207,7 +209,7 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                if node_fanout_enabled():
+                if use_node_fanout:
                     recv_reqs = get_node_fanout(
                         tp_group, get_parallel().nnodes
                     ).broadcast(recv_reqs)

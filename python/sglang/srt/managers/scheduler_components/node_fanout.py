@@ -34,7 +34,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import ShmPointerMMData
 from sglang.srt.runtime_context import get_parallel, get_serving
-from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.utils import broadcast_pyobj, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
@@ -49,16 +49,30 @@ def node_fanout_enabled() -> bool:
     DP attention and pipeline parallelism retain their existing transport.
     Pre-tokenized requests also retain it because they skip SHM materialization.
     """
+    if not envs.SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST.get():
+        return False
+
     parallel = get_parallel()
-    return (
-        envs.SGLANG_NODE_FANOUT_REQ_BROADCAST.get()
-        and parallel.nnodes > 1
-        and parallel.tp_size > 1
-        and parallel.pp_size == 1
-        and parallel.tp_size % parallel.nnodes == 0
-        and not parallel.attn_dp_enabled
-        and not get_serving().skip_tokenizer_init
+    if parallel.nnodes <= 1:
+        reason = "requires nnodes > 1"
+    elif parallel.tp_size <= 1:
+        reason = "requires tp_size > 1"
+    elif parallel.pp_size != 1:
+        reason = "requires pp_size == 1"
+    elif parallel.tp_size % parallel.nnodes != 0:
+        reason = "requires tp_size to be divisible by nnodes"
+    elif parallel.attn_dp_enabled:
+        reason = "does not support DP attention"
+    elif get_serving().skip_tokenizer_init:
+        reason = "requires tokenizer initialization"
+    else:
+        return True
+
+    print_warning_once(
+        "SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST is set, but node fan-out "
+        f"request broadcast is disabled: {reason}. Using the existing transport."
     )
+    return False
 
 
 def _tokenized(reqs: List[Any]) -> List[Any]:
