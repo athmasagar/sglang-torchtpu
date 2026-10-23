@@ -595,9 +595,9 @@ def _register_models() -> None:
     """Add the model implementations that only this package provides to the registry."""
     from sglang.srt.models.registry import ModelRegistry
 
-    # A module that fails to import is logged and skipped, so it can't take the
-    # other models down with it; an arch core already serves raises.
-    ModelRegistry.register("sglang_tpu.models")
+    # External models can resolve without importing the unused core catalog.
+    # Other architectures load both catalogs and retain duplicate checks.
+    ModelRegistry.register_lazy("sglang_tpu.models")
 
 
 def _resolve_num_hidden_layers(server_args) -> int:
