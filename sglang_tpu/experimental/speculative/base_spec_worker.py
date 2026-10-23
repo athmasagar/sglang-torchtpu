@@ -449,23 +449,21 @@ class TpuSpecWorker(BaseSpecWorker):
         Noop: never.
         """
 
-    @abstractmethod
     def make_verify_input(
         self,
         *,
         batch: ScheduleBatch,
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
-        draft_result: DraftResult | None = None,
     ) -> SpecInput:
         """The algorithm's own TARGET_VERIFY spec_info for [pbs * (N + 1)] verify rows.
 
         Why: attention backends and the dynamo tracer key on the algorithm's
         verify type; its compile policy must warm the same structure.
-        draft_result carries this step's proposals and probabilities; idle
-        ranks that only mirror the target forward leave it None.
-        Noop: never.
+        Workers using the shared verify or idle-verify path must implement this.
+        A custom verify may construct its spec_info directly.
         """
+        raise NotImplementedError("Shared verification requires make_verify_input().")
 
     def make_dummy_carry(self, rows: int) -> Any:
         """A zero draft_carry of rows rows on device, shaped and typed like serving.
@@ -497,7 +495,6 @@ class TpuSpecWorker(BaseSpecWorker):
             batch=batch,
             verify_tokens=verify_tokens,
             rows=rows,
-            draft_result=draft_result,
         )
         logits_output = self._forward_target_verify(
             batch=batch,

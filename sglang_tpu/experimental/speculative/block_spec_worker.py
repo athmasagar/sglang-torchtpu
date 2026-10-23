@@ -271,7 +271,6 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         batch: ScheduleBatch,
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
-        draft_result: DraftResult | None = None,
     ) -> DFlashVerifyInput:
         return DFlashVerifyInput(
             draft_token=verify_tokens,

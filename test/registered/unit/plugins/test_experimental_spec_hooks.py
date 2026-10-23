@@ -130,7 +130,6 @@ class TestExperimentalSpecHooks(CustomTestCase):
             batch=batch,
             verify_tokens=draft.verify_tokens,
             rows=rows,
-            draft_result=draft,
         )
         self.assertIs(build.call_args.kwargs["spec_info"], metadata)
         self.assertTrue(metadata.keep_outputs_padded)
