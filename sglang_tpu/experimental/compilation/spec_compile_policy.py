@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -59,3 +60,15 @@ class TpuSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
         if self.is_draft_worker:
             batch.input_embeds = None
         return batch
+
+    def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        if is_dp_attention_enabled() and forward_batch.dp_padding_mode is None:
+            # forward_draft_rows builds its TARGET_VERIFY batch directly at the
+            # bucket without init_new, so stamp the bucket DP metadata as _run_one does.
+            self._set_dp_attention_metadata(
+                forward_batch,
+                int(forward_batch.input_ids.shape[0]),
+                forward_batch.batch_size,
+                forward_batch.forward_mode,
+            )
+        super().prepare_forward_batch(forward_batch)

@@ -92,9 +92,13 @@ def spec_dpa_runner(base_url: str):
     }
 
 
-# The recipe owns the serving config; these two only point it at the CI
-# weights mount when there is one.
-LAUNCH_ENV = {"MODEL": MODEL_PATH, "DRAFT_MODEL": DRAFT_MODEL_PATH}
+# The recipe owns the serving config; these point it at the CI weights mount
+# when there is one and opt this gate into the experimental spec worker.
+LAUNCH_ENV = {
+    "MODEL": MODEL_PATH,
+    "DRAFT_MODEL": DRAFT_MODEL_PATH,
+    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
+}
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,

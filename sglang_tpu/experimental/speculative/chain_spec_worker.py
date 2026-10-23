@@ -296,14 +296,18 @@ class TpuChainSpecWorker(TpuSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        self._tp_sync.sync(SpecTpSyncSite.SPEC_TARGET, result.next_token_ids)
         if not batch.reqs:
             # A DP-attention rank without prompts (DP padding relabels its batch)
-            # still issues the draft prefill's collectives.
+            # still issues the target token sync and draft prefill's collectives.
+            padded_bs = self._pad_bs(max(batch.global_num_tokens_for_logprob or (1,)))
+            self._tp_sync.sync(
+                SpecTpSyncSite.SPEC_TARGET, self._device_zeros(padded_bs)
+            )
             self._forward_idle_draft_prefill(
                 batch, target_hidden=result.logits_output.hidden_states
             )
             return self._idle_extend_result(result)
+        self._tp_sync.sync(SpecTpSyncSite.SPEC_TARGET, result.next_token_ids)
         bs = batch.seq_lens.shape[0]
         # Sampling ran at the batch bucket; the draft reads it there, the scheduler takes live rows.
         bucket_tokens = result.next_token_ids
@@ -453,16 +457,24 @@ class TpuChainSpecWorker(TpuSpecWorker):
     def _forward_idle_draft_prefill(
         self, batch: ScheduleBatch, *, target_hidden: torch.Tensor
     ) -> None:
+        padded_tokens = target_hidden.shape[0]
         forward_batch = ForwardBatch.init_new(
             batch,
             self._draft_runner,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             return_hidden_states_before_norm=False,
         )
+        forward_batch.input_ids = self._device_zeros(padded_tokens)
         forward_batch.spec_info = chain_draft_forward_input(
-            hidden_states=target_hidden[:0], width=1
+            hidden_states=target_hidden, width=1
         )
         forward_batch.return_logprob = False
+        if forward_batch.global_num_tokens_cpu is not None:
+            num_ranks = len(forward_batch.global_num_tokens_cpu)
+            forward_batch.global_num_tokens_cpu = [padded_tokens] * num_ranks
+            forward_batch.global_num_tokens_gpu = torch.full(
+                (num_ranks,), padded_tokens, dtype=torch.int64
+            ).to(self.device, non_blocking=True)
         with self._chain_draft_worker.draft_context(), torch.no_grad():
             self._draft_runner.forward(forward_batch)
 

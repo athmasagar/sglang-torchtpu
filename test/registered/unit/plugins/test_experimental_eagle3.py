@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -18,9 +19,15 @@ from sglang_tpu.envs import envs
 from sglang_tpu.experimental.compilation.chain_compile_policy import (
     _hidden_only_logits,
 )
+from sglang_tpu.experimental.compilation.spec_compile_policy import (
+    TpuSpecDecodeCompilePolicyMixin,
+)
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
 from sglang_tpu.experimental.speculative import spec_ops
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+from sglang_tpu.experimental.speculative.chain_draft_input import (
+    chain_draft_forward_input,
+)
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
 from sglang_tpu.experimental.speculative.chain_spec_worker import (
     TpuChainSpecWorker,
@@ -126,6 +133,93 @@ class TestExperimentalEagle3(CustomTestCase):
         worker._dp_attention = False
         self.assertEqual(TpuSpecWorker._decode_bucket(worker, synced, 1), 1)
         self.assertEqual(TpuSpecWorker._decode_buckets_for(worker, 3), [4])
+
+    def test_bucket_view_reports_the_bucket_to_dp_attention(self):
+        """DP attention syncs the live counts; the verify view reports the
+        bucket on every rank and restores the live counts on exit."""
+        zeros = torch.zeros((8,), dtype=torch.int64)
+        batch = SimpleNamespace(
+            multimodal_inputs=None,
+            seq_lens=zeros[:1],
+            seq_lens_cpu=zeros[:1],
+            seq_lens_sum=0,
+            orig_seq_lens=zeros[:1],
+            req_pool_indices=zeros[:1],
+            req_pool_indices_cpu=zeros[:1],
+            global_num_tokens=[1, 5, 0],
+            global_num_tokens_for_logprob=[1, 5, 0],
+        )
+        bucket_state = SpecState(
+            bonus_tokens=zeros, seq_lens=zeros, req_pool_indices=zeros
+        )
+        verify_input = SimpleNamespace(
+            req_pool_indices_cpu=zeros,
+            padded_kv_lens_after_rows=lambda rows: (zeros, 0),
+        )
+        with TpuSpecWorker._bucket_view(
+            batch,
+            bucket_state=bucket_state,
+            verify_input=verify_input,
+            kv_rows=4,
+        ) as view:
+            self.assertEqual(view.global_num_tokens, [8, 8, 8])
+            self.assertEqual(view.global_num_tokens_for_logprob, [8, 8, 8])
+        self.assertEqual(batch.global_num_tokens, [1, 5, 0])
+
+        batch.global_num_tokens = batch.global_num_tokens_for_logprob = None
+        with TpuSpecWorker._bucket_view(
+            batch,
+            bucket_state=bucket_state,
+            verify_input=verify_input,
+            kv_rows=4,
+        ) as view:
+            self.assertIsNone(view.global_num_tokens)
+            self.assertIsNone(view.global_num_tokens_for_logprob)
+        self.assertIsNone(batch.global_num_tokens)
+
+    def test_spec_compile_policy_stamps_dp_metadata_on_raw_draft_rows_batch(self):
+        """forward_draft_rows constructs its TARGET_VERIFY batch without init_new;
+        prepare_forward_batch stamps the bucket DP metadata before the pad shim."""
+        calls = []
+
+        class _Base:
+            def _set_dp_attention_metadata(self, batch, num_tokens, bs, mode):
+                calls.append(("dp", num_tokens, bs, mode))
+                batch.dp_padding_mode = "MAX_LEN"
+
+            def prepare_forward_batch(self, batch):
+                calls.append(("super", batch.dp_padding_mode))
+
+        class _Policy(TpuSpecDecodeCompilePolicyMixin, _Base):
+            pass
+
+        policy = object.__new__(_Policy)
+        batch = SimpleNamespace(
+            input_ids=torch.zeros((12,), dtype=torch.int64),
+            batch_size=4,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            dp_padding_mode=None,
+        )
+        with patch(
+            "sglang_tpu.experimental.compilation.spec_compile_policy.is_dp_attention_enabled",
+            return_value=False,
+        ):
+            policy.prepare_forward_batch(batch)
+        with patch(
+            "sglang_tpu.experimental.compilation.spec_compile_policy.is_dp_attention_enabled",
+            return_value=True,
+        ):
+            policy.prepare_forward_batch(batch)
+            policy.prepare_forward_batch(batch)
+        self.assertEqual(
+            calls,
+            [
+                ("super", None),
+                ("dp", 12, 4, ForwardMode.TARGET_VERIFY),
+                ("super", "MAX_LEN"),
+                ("super", "MAX_LEN"),
+            ],
+        )
 
     def test_dp_unpadding_keeps_host_padded_extend_outputs(self):
         """DP attention's post-forward unpadding trims outputs to live rows; a
@@ -528,6 +622,96 @@ class TestExperimentalEagle3(CustomTestCase):
             batch=None, state=state, rows=None, verify_input=verify_input
         )
         self.assertEqual(calls, [("draft", None, None), ("verify",), ("commit", "out")])
+
+    def test_forward_idle_decode_supplies_seq_lens_cpu_and_restores_idle_batch(self):
+        """_forward_idle_decode overrides an idle batch's None seq_lens_cpu with
+        verify_input.seq_lens_cpu during the step and restores None on exit."""
+        worker = _chain_worker()
+        worker.device = "cpu"
+        worker._decode_bucket = lambda batch, bs: 4
+        worker._device_zeros = lambda rows: torch.zeros((rows,), dtype=torch.int64)
+        worker.make_dummy_carry = lambda rows: None
+        seen_seq_lens_cpu = []
+
+        def fake_idle_step(**kwargs):
+            seen_seq_lens_cpu.append(kwargs["batch"].seq_lens_cpu)
+            kwargs["batch"].seq_lens_cpu = torch.ones((4,), dtype=torch.int64)
+
+        worker._forward_idle_step = fake_idle_step
+        empty = torch.empty((0,), dtype=torch.int64)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            spec_info=None,
+            input_ids=empty,
+            out_cache_loc=empty,
+            seq_lens_cpu=None,
+        )
+        worker._forward_idle_decode(batch)
+        self.assertEqual(len(seen_seq_lens_cpu), 1)
+        self.assertIsInstance(seen_seq_lens_cpu[0], torch.Tensor)
+        self.assertIsNone(batch.seq_lens_cpu)
+
+    def test_idle_draft_prefill_matches_bucket_and_keeps_outputs_padded(self):
+        """An idle DP rank's extend syncs a bucketed zero token tensor and runs
+        draft prefill at the target hidden's token bucket with outputs kept padded."""
+        worker = _chain_worker()
+        worker.device = "cpu"
+        worker._pad_bs = lambda n: max(4, n)
+        worker._device_zeros = lambda rows: torch.zeros((rows,), dtype=torch.int64)
+        calls = []
+        worker._tp_sync = SimpleNamespace(
+            sync=lambda site, tensor: calls.append(("sync", site, tuple(tensor.shape)))
+        )
+        seen = []
+        worker._draft_runner = SimpleNamespace(
+            forward=lambda fb: (calls.append(("draft",)), seen.append(fb))
+        )
+        worker._chain_draft_worker = SimpleNamespace(
+            draft_context=contextlib.nullcontext
+        )
+        target_hidden = torch.zeros((16, 4))
+        worker._target_worker = SimpleNamespace(
+            forward_batch_generation=lambda *args, **kwargs: SimpleNamespace(
+                next_token_ids=torch.zeros((0,), dtype=torch.int64),
+                logits_output=SimpleNamespace(hidden_states=target_hidden),
+                new_seq_lens=None,
+            )
+        )
+        worker._idle_result = lambda: SimpleNamespace(
+            next_token_ids=None, new_seq_lens=None, next_draft_input=None
+        )
+        batch = SimpleNamespace(
+            reqs=[],
+            global_num_tokens=[6, 0],
+            global_num_tokens_for_logprob=[1, 0],
+        )
+        with patch(
+            "sglang_tpu.experimental.speculative.chain_spec_worker.ForwardBatch.init_new",
+            side_effect=lambda *args, **kwargs: SimpleNamespace(
+                global_num_tokens_cpu=[6, 0],
+                global_num_tokens_gpu=None,
+            ),
+        ):
+            worker.extend(batch, pp_proxy_tensors=None)
+        self.assertEqual(
+            calls, [("sync", SpecTpSyncSite.SPEC_TARGET, (4,)), ("draft",)]
+        )
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(
+            torch.equal(seen[0].input_ids, torch.zeros((16,), dtype=torch.int64))
+        )
+        self.assertTrue(seen[0].spec_info.keep_outputs_padded)
+        self.assertIs(seen[0].spec_info.hidden_states, target_hidden)
+        self.assertEqual(seen[0].global_num_tokens_cpu, [16, 16])
+        self.assertEqual(seen[0].global_num_tokens_gpu.tolist(), [16, 16])
+
+    def test_chain_draft_forward_input_keeps_outputs_padded_by_default(self):
+        """Draft forward inputs return _hidden_only_logits (next_token_logits=None),
+        so post_forward_mlp_sync_batch must keep outputs padded on both active and idle ranks."""
+        spec_info = chain_draft_forward_input(
+            hidden_states=torch.zeros((8, 4)), width=1
+        )
+        self.assertTrue(spec_info.keep_outputs_padded)
 
     def test_dp_attention_drafts_greedy(self):
         """Under DP attention the draft never samples: peers and idle ranks must

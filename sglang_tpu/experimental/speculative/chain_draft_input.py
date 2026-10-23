@@ -42,10 +42,12 @@ def chain_draft_forward_input(
     *, hidden_states: torch.Tensor, width: int
 ) -> ChainDraftForwardInput:
     device = hidden_states.device
-    return ChainDraftForwardInput(
+    spec_info = ChainDraftForwardInput(
         draft_token=torch.empty((0,), dtype=torch.long, device=device),
         positions=torch.empty((0,), dtype=torch.int64, device=device),
         draft_token_num=width,
         custom_mask=None,
         hidden_states=hidden_states,
     )
+    spec_info.keep_outputs_padded = True
+    return spec_info

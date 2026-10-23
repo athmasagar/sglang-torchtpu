@@ -736,6 +736,7 @@ class TpuSpecWorker(BaseSpecWorker):
             spec_info=batch.spec_info,
             input_ids=batch.input_ids,
             out_cache_loc=batch.out_cache_loc,
+            seq_lens_cpu=verify_input.seq_lens_cpu,
         ):
             self._forward_idle_step(
                 batch=batch, state=state, rows=rows, verify_input=verify_input
@@ -1100,6 +1101,12 @@ class TpuSpecWorker(BaseSpecWorker):
             multimodal_inputs = multimodal_inputs + [None] * (
                 padded_bs - len(multimodal_inputs)
             )
+        global_num_tokens = batch.global_num_tokens
+        if global_num_tokens is not None:
+            # DP attention syncs the live request counts; the rows are already at the
+            # bucket, so the verify batch reports it on every rank (as _extend_draft
+            # does for the draft) and the policies' DP padding stays a no-op.
+            global_num_tokens = [padded_bs] * len(global_num_tokens)
         view_fields = {
             "multimodal_inputs": multimodal_inputs,
             "seq_lens": bucket_state.seq_lens,
@@ -1109,6 +1116,8 @@ class TpuSpecWorker(BaseSpecWorker):
             "orig_seq_lens": None,
             "req_pool_indices": bucket_state.req_pool_indices,
             "req_pool_indices_cpu": verify_input.req_pool_indices_cpu,
+            "global_num_tokens": global_num_tokens,
+            "global_num_tokens_for_logprob": global_num_tokens,
             **overrides,
         }
         return overridden_fields(batch, **view_fields)
